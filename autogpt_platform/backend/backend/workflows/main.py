@@ -3,7 +3,7 @@
 Manual Dashboard setup (Render Blueprints cannot declare Workflows):
   - New > Workflow, link this repo
   - Root Directory:  autogpt_platform/backend
-  - Build Command:   poetry install
+  - Build Command:   poetry install && poetry run pip install --no-deps render_sdk==0.7.0
   - Start Command:   poetry run python -m backend.workflows.main
   - Env: DATABASE_URL/DIRECT_URL (+ ?schema=platform), REDIS_* (standalone),
     RENDER_API_KEY, EXECUTION_BACKEND=workflows, RENDER_WORKFLOW_SLUG,

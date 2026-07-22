@@ -18,13 +18,9 @@ import time
 from backend.data import redis_client as redis
 from backend.data.redis_helpers import SlotAdmission, try_acquire_concurrency_slot
 from backend.util.settings import Settings
+from backend.workflows.constants import RUN_ARTIFACT_TTL_SECONDS
 
 settings = Settings()
-
-# Stale-slot reclaim window: a slot whose holder crashed is swept after this
-# many seconds. Matches the 24h max run duration + margin.
-_SLOT_STALE_SECONDS = 25 * 60 * 60
-_SLOT_TTL_SECONDS = 25 * 60 * 60
 
 
 class ExecutionRateLimitError(Exception):
@@ -47,8 +43,8 @@ async def acquire_run_slot(user_id: str, graph_exec_id: str) -> bool:
         slot_id=graph_exec_id,
         score=now,
         capacity=settings.config.max_concurrent_graph_executions_per_user,
-        stale_before_score=now - _SLOT_STALE_SECONDS,
-        ttl_seconds=_SLOT_TTL_SECONDS,
+        stale_before_score=now - RUN_ARTIFACT_TTL_SECONDS,
+        ttl_seconds=RUN_ARTIFACT_TTL_SECONDS,
     )
     return admission != SlotAdmission.REJECTED
 

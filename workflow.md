@@ -38,7 +38,7 @@ template must not carry it.
 3. **Create the executor Workflow manually in the Render Dashboard** (not in render.yaml):
    - New → Workflow, link the repo, same workspace + region (oregon).
    - Root Directory: `autogpt_platform/backend`
-   - Build: `poetry install && poetry run pip install --no-deps render_sdk`
+   - Build: `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`
    - Start: `poetry run python -m backend.workflows.main`
    - Env: `DATABASE_URL`/`DIRECT_URL` (+ `?schema=platform` wrapper), `REDIS_HOST`/`PORT`,
      `REDIS_PASSWORD=""`, `REDIS_CLUSTER_MODE=false`, `EXECUTION_BACKEND=workflows`,

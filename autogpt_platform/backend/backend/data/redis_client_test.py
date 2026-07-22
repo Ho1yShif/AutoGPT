@@ -1,4 +1,4 @@
-"""Unit tests for the cluster-only Redis client in ``redis_client``.
+"""Unit tests for the Redis client in ``redis_client`` (cluster + standalone).
 
 Patches the redis-py constructors + ``ping()`` so no real Redis is needed.
 """

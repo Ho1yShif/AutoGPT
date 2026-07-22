@@ -27,13 +27,13 @@ declare Workflows yet); the backend reaches it via `RENDER_WORKFLOW_SLUG`.
         NEXT_PUBLIC_* (HTTPS) │       │ private proxy
               ┌───────────────┘       ▼
               ▼                 ┌─────────────────────┐
-   ┌──────────────────┐  WSS    │ gotrue (auth, pserv)│──┐
-   │ websocket-server │◀──────▶ └─────────────────────┘  │
+   ┌──────────────────┐  WSS    │ gotrue (auth, pserv)│───┐
+   │ websocket-server │◀──────▶ └─────────────────────┘   │
    │   (docker, web)  │                                   │ SQL
-   └────────┬─────────┘        ┌───────────────────────┐ │
+   └────────┬─────────┘         ┌───────────────────────┐ │
             │            ┌────▶ │ rest-server (docker,  │ │
-            │            │      │  web) — owns migrations│─┤
-            │            │      └──┬─────────┬────────┬──┘ │
+            │            │      │ web) — owns migrations│─┤
+            │            │      └──┬─────────┬────────┬─┘ │
             │ pub/sub    │  RPC    │ SQL     │ cache  │ start_task()
             ▼            │         ▼         ▼        ▼    ▼
    ┌──────────────┐  ┌───┴──────┐ ┌──────────┐ ┌──────────┐ ┌────────────────────┐
@@ -153,7 +153,7 @@ and Key Value exist:
 
 1. **New → Workflow**, link this repo, same workspace + region.
 2. **Root Directory:** `autogpt_platform/backend`
-   **Build Command:** `poetry install && poetry run pip install --no-deps render_sdk`
+   **Build Command:** `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`
    **Start Command:** `poetry run python -m backend.workflows.main`
 3. Give it the same DB / Redis / secret wiring as the backend (`DATABASE_URL` +
    `DIRECT_URL` with `?schema=platform`, `REDIS_*`, `REDIS_CLUSTER_MODE=false`,

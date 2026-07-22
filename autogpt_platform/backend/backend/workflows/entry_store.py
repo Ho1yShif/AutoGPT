@@ -12,10 +12,7 @@ from typing import cast
 
 from backend.data import redis_client as redis
 from backend.data.execution import GraphExecutionEntry
-
-# > 24h max run duration so the entry never disappears mid-dispatch; the blob
-# is only actually read at run start, so this is a generous safety margin.
-_ENTRY_TTL_SECONDS = 25 * 60 * 60
+from backend.workflows.constants import RUN_ARTIFACT_TTL_SECONDS
 
 
 def _key(graph_exec_id: str) -> str:
@@ -33,7 +30,7 @@ async def store_execution_entry(entry: GraphExecutionEntry) -> None:
     await r.set(
         _key(entry.graph_exec_id),
         entry.model_dump_json(),
-        ex=_ENTRY_TTL_SECONDS,
+        ex=RUN_ARTIFACT_TTL_SECONDS,
     )
 
 

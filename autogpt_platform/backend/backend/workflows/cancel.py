@@ -21,8 +21,8 @@ import threading
 import time
 
 from backend.data import redis_client as redis
+from backend.workflows.constants import RUN_ARTIFACT_TTL_SECONDS
 
-_CANCEL_TTL_SECONDS = 25 * 60 * 60
 _POLL_INTERVAL_SECONDS = 2.0
 
 
@@ -33,7 +33,7 @@ def _key(graph_exec_id: str) -> str:
 async def request_cancel(graph_exec_id: str) -> None:
     """Set the cooperative cancel flag (called by the producer/stop path)."""
     r = await redis.get_redis_async()
-    await r.set(_key(graph_exec_id), "1", ex=_CANCEL_TTL_SECONDS)
+    await r.set(_key(graph_exec_id), "1", ex=RUN_ARTIFACT_TTL_SECONDS)
 
 
 def is_cancel_requested_sync(graph_exec_id: str) -> bool:

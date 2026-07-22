@@ -25,7 +25,7 @@ def _task_slug() -> str:
         raise RuntimeError(
             "RENDER_WORKFLOW_SLUG is not set but EXECUTION_BACKEND=workflows. "
             "Set it to the slug of the manually-created Render Workflow "
-            "(task id '{slug}/run_graph_execution')."
+            "(task id '<slug>/run_graph_execution')."
         )
     return f"{slug}/{TASK_NAME}"
 

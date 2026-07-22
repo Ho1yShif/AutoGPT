@@ -23,14 +23,13 @@ from backend.data import redis_client as redis
 from backend.executor.cluster_lock import ClusterLock
 from backend.executor.engine import ExecutionProcessor
 from backend.util.settings import Settings
+from backend.workflows.constants import MAX_RUN_SECONDS
 
 from . import cancel as cancel_mod
 from . import entry_store, rate_limit
 
 logger = logging.getLogger(__name__)
 settings = Settings()
-
-_MAX_RUN_SECONDS = 24 * 60 * 60  # Render Workflows hard ceiling (86,400s)
 
 # Retries DISABLED: pre-flight billing is not idempotent for a node that was
 # already RUNNING when a run died (the engine re-enqueues + re-charges it on
@@ -39,7 +38,7 @@ _NO_RETRY = Retry(max_retries=0, wait_duration_ms=0)
 
 app = Workflows(
     default_retry=_NO_RETRY,
-    default_timeout=_MAX_RUN_SECONDS,
+    default_timeout=MAX_RUN_SECONDS,
     default_plan="standard",
 )
 
@@ -47,7 +46,7 @@ app = Workflows(
 @app.task(
     name="run_graph_execution",
     retry=_NO_RETRY,
-    timeout_seconds=_MAX_RUN_SECONDS,
+    timeout_seconds=MAX_RUN_SECONDS,
 )
 def run_graph_execution(graph_exec_id: str, user_id: str) -> dict:
     """Execute a single graph run dispatched via Render Workflows.
