@@ -5,7 +5,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future
-from typing import Literal, Mapping, Optional, cast
+from typing import Literal, Mapping, Optional, Protocol, cast
 
 from pydantic import BaseModel, JsonValue, ValidationError
 
@@ -43,6 +43,7 @@ from backend.data.model import (
     NodeExecutionStats,
 )
 from backend.data.rabbitmq import Exchange, ExchangeType, Queue, RabbitMQConfig
+from backend.data.redis_helpers import SlotAdmission
 from backend.util.clients import (
     get_async_execution_event_bus,
     get_async_execution_queue,
@@ -529,9 +530,9 @@ async def _validate_node_input_credentials(
             except ValidationError as e:
                 # Validation error means credentials were provided but invalid
                 # This should always be an error, even if optional
-                credential_errors[node.id][field_name] = (
-                    f"{CRED_ERR_INVALID_PREFIX} {e}"
-                )
+                credential_errors[node.id][
+                    field_name
+                ] = f"{CRED_ERR_INVALID_PREFIX} {e}"
                 continue
 
             try:
@@ -542,15 +543,15 @@ async def _validate_node_input_credentials(
             except Exception as e:
                 # Handle any errors fetching credentials
                 # If credentials were explicitly configured but unavailable, it's an error
-                credential_errors[node.id][field_name] = (
-                    f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
-                )
+                credential_errors[node.id][
+                    field_name
+                ] = f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
                 continue
 
             if not credentials:
-                credential_errors[node.id][field_name] = (
-                    f"{CRED_ERR_UNKNOWN_PREFIX}{credentials_meta.id}"
-                )
+                credential_errors[node.id][
+                    field_name
+                ] = f"{CRED_ERR_UNKNOWN_PREFIX}{credentials_meta.id}"
                 continue
 
             if (
@@ -660,18 +661,18 @@ async def _validate_node_input_credentials(
                             _mark_optional_skip()
                             continue
                         has_missing_credentials = True
-                        credential_errors[node.id][field_name] = (
-                            f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
-                        )
+                        credential_errors[node.id][
+                            field_name
+                        ] = f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
                         continue
                     if not creds:
                         if field_is_optional:
                             _mark_optional_skip()
                             continue
                         has_missing_credentials = True
-                        credential_errors[node.id][field_name] = (
-                            f"{CRED_ERR_UNKNOWN_PREFIX}{cred_id}"
-                        )
+                        credential_errors[node.id][
+                            field_name
+                        ] = f"{CRED_ERR_UNKNOWN_PREFIX}{cred_id}"
 
         # If node has optional credentials and any are missing, skip the
         # node so the executor doesn't try to execute it with None creds.
@@ -1077,6 +1078,17 @@ async def stop_graph_execution(
     use_workflows = config.execution_backend == "workflows"
     db = execution_db if prisma.is_connected() else get_database_manager_async_client()
 
+    # Authorize FIRST: verify the caller owns this execution before emitting any
+    # cancel signal or cascading. `request_cancel` / the RabbitMQ fan-out are
+    # unauthenticated primitives, and when `wait_timeout` is falsy we return
+    # before the wait loop's ownership-scoped read ever runs — so without this
+    # up-front check a caller could terminate another tenant's execution.
+    graph_exec = await db.get_graph_execution_meta(
+        execution_id=graph_exec_id, user_id=user_id
+    )
+    if not graph_exec:
+        raise NotFoundError(f"Graph execution #{graph_exec_id} not found.")
+
     # First, find and stop all child executions if cascading
     if cascade:
         children = await _get_child_executions(graph_exec_id)
@@ -1189,10 +1201,23 @@ async def stop_graph_execution(
     )
 
 
+class _RenderRunIdSetter(Protocol):
+    """Structural type for the DB handle `_dispatch_via_workflows` writes through.
+
+    Both the `backend.data.execution` module and `DatabaseManagerAsyncClient`
+    expose `set_render_run_id`; this Protocol makes that the explicit contract
+    instead of relying on untyped duck-typing.
+    """
+
+    async def set_render_run_id(
+        self, graph_exec_id: str, render_run_id: str
+    ) -> None: ...
+
+
 async def _dispatch_via_workflows(
     graph_exec_entry: GraphExecutionEntry,
     user_id: str,
-    edb,
+    edb: _RenderRunIdSetter,
 ) -> None:
     """Dispatch a graph execution to Render Workflows (EXECUTION_BACKEND=workflows).
 
@@ -1202,12 +1227,17 @@ async def _dispatch_via_workflows(
     """
     graph_exec_id = graph_exec_entry.graph_exec_id
 
-    if not await wf_rate_limit.acquire_run_slot(user_id, graph_exec_id):
+    admission = await wf_rate_limit.acquire_run_slot(user_id, graph_exec_id)
+    if admission == SlotAdmission.REJECTED:
         raise wf_rate_limit.ExecutionRateLimitError(
             f"User {user_id} is at the concurrent-execution limit "
             f"({config.max_concurrent_graph_executions_per_user}); "
             "try again once a running execution finishes."
         )
+    # Only a newly-ADMITTED slot is owned by this call. A REFRESHED slot belongs
+    # to the still-running original run (resume/requeue of the same exec id);
+    # releasing it on dispatch failure would drop a slot that run still needs.
+    owns_slot = admission == SlotAdmission.ADMITTED
     try:
         await wf_entry_store.store_execution_entry(graph_exec_entry)
         render_run_id = await wf_client.dispatch_graph_execution(graph_exec_id, user_id)
@@ -1217,8 +1247,10 @@ async def _dispatch_via_workflows(
             f"(run_id={render_run_id})"
         )
     except BaseException:
-        # Free the reserved slot so a failed dispatch doesn't leak capacity.
-        await wf_rate_limit.release_run_slot(user_id, graph_exec_id)
+        # Free the reserved slot so a failed dispatch doesn't leak capacity —
+        # but never release a slot the still-running original run owns.
+        if owns_slot:
+            await wf_rate_limit.release_run_slot(user_id, graph_exec_id)
         raise
 
 

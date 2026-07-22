@@ -199,12 +199,15 @@ async def _fetch_user_context_data(user_id: str) -> Context:
     """
     Fetch user context for LaunchDarkly from the platform database.
 
-    Successful lookups are cached for 24h (see ``_fetch_db_user_context``).
-    Failed lookups are NOT cached: the degraded anonymous fallback is built
-    outside the cache so the next evaluation retries the lookup instead of
-    pinning this process to an email-less context for a full TTL — which
-    would make its email-targeted flag evaluations silently diverge from
-    peer processes.  The degraded path costs one failed DB lookup per
+    Successful lookups AND not-found results are cached for 24h (see
+    ``_fetch_db_user_context``): a not-found id is a stable, cacheable
+    anonymous context, so a valid-but-deleted user id does not re-hit the DB
+    on every evaluation.  Only genuinely TRANSIENT lookup failures (DB
+    unreachable, timeout) are NOT cached: the degraded anonymous fallback for
+    those is built outside the cache so the next evaluation retries the lookup
+    instead of pinning this process to an email-less context for a full TTL —
+    which would make its email-targeted flag evaluations silently diverge from
+    peer processes.  That degraded path costs one failed DB lookup per
     evaluation; bounded, and acceptable versus a 24h-poisoned cache.
 
     Args:
@@ -255,15 +258,28 @@ async def _fetch_db_user_context(user_id: str) -> Context:
     only ``email``/``email_domain``/``created_at``. Re-add a GoTrue admin
     REST call here if role-attribute flag targeting is ever needed.
 
-    Raises on lookup failure: ``@cached`` never stores results of calls
-    that raise, so a degraded context can't be cached here — the caller
-    handles the fallback outside the cache.
+    Not-found vs transient failure are handled differently:
+
+    * **Not found** (``get_user_by_id`` raises ``ValueError`` — a valid-UUID id
+      that maps to no ``platform.User``, e.g. a deleted account) is a STABLE
+      result. We return an anonymous context for it, which ``@cached`` then
+      stores, so repeated flag evaluations for the same dead id don't re-hit
+      the DB on every call.
+    * **Transient failure** (any other exception — DB unreachable, timeout)
+      propagates. ``@cached`` never stores results of calls that raise, so a
+      transient degradation can't be cached here — the caller handles that
+      fallback outside the cache and retries on the next evaluation.
     """
     from backend.data.user import get_user_by_id
 
     builder = Context.builder(user_id).kind("user").anonymous(True)
 
-    user = await get_user_by_id(user_id)
+    try:
+        user = await get_user_by_id(user_id)
+    except ValueError:
+        # User not found — cache the anonymous context (stable result).
+        return builder.build()
+
     builder.anonymous(False)
     if user.email:
         builder.set("email", user.email)

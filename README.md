@@ -76,8 +76,10 @@ Created once by Render and shared across services via `fromGroup`; you never set
 | Key | Used by | Notes |
 |-----|---------|-------|
 | `JWT_VERIFY_KEY` | rest, ws, scheduler, db-manager, GoTrue | HS256 secret; copied into GoTrue's `GOTRUE_JWT_SECRET`. |
-| `ENCRYPTION_KEY` | rest, ws, scheduler, db-manager, **Workflow** | Fernet key for stored credentials. **Must be identical everywhere** — copy the group value into the manual Workflow. **Verify** it is a valid url-safe-base64 32-byte Fernet key on first deploy (see below). |
 | `UNSUBSCRIBE_SECRET_KEY` | rest | Signs email unsubscribe links. |
+
+> `ENCRYPTION_KEY` is **not** auto-generated — Render's `generateValue` is not guaranteed to
+> be a valid Fernet key. It is deployer-supplied instead (see the table below).
 
 ### Deployer-supplied (Dashboard prompts, `sync: false`)
 
@@ -86,6 +88,7 @@ entered in the Dashboard at deploy time.
 
 | Key | Service(s) | What to enter |
 |-----|-----------|---------------|
+| `ENCRYPTION_KEY` | rest, ws, scheduler, db-manager, **Workflow** | Fernet key for stored credentials — **generate once, paste the identical value into all 5** (see below) |
 | `RENDER_API_KEY` | rest-server, scheduler-server | Render workspace API key (Workflows dispatch) |
 | `RENDER_WORKFLOW_SLUG` | rest-server, scheduler-server | Slug of the manual executor Workflow — **unknown until it exists**; set + redeploy |
 | `PLATFORM_BASE_URL` | rest-server | Backend (rest-server) public origin |
@@ -115,17 +118,23 @@ payload: {"role":"anon","iss":"supabase","aud":"authenticated"}
 Sign it with the group's `JWT_VERIFY_KEY` (e.g. via jwt.io). For a no-Kong deploy any
 non-empty value works, but a correct anon JWT is recommended.
 
-#### Verifying `ENCRYPTION_KEY`
+#### Generating `ENCRYPTION_KEY`
 
 The backend loads `ENCRYPTION_KEY` as a `cryptography.fernet.Fernet` key — it must be
-url-safe base64 of exactly 32 bytes. Render's `generateValue` produces a 256-bit base64
-secret (the right length). After the first deploy, if any credential save/read logs a
-`Fernet key must be 32 url-safe base64-encoded bytes` error, replace the group value with a
-proper key and set the **same** value on the executor Workflow:
+url-safe base64 of exactly 32 bytes, which Render's `generateValue` does **not** guarantee
+(it can emit `+`/`/` chars that Fernet rejects). So it is deployer-supplied. Generate **one**
+key and paste that **identical** value into all five places (`rest-server`,
+`websocket-server`, `scheduler-server`, `database-manager`, and the executor Workflow):
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
+
+Each backend service logs a non-secret fingerprint at boot —
+`ENCRYPTION_KEY loaded (fingerprint=<12 hex chars>)`. Confirm every service prints the
+**same** fingerprint; a mismatch means a service has a different key and credential
+decryption will fail. If `ENCRYPTION_KEY` is malformed, the service fails fast at startup
+with a clear error instead of an opaque runtime `InvalidToken`.
 
 ---
 
@@ -156,10 +165,11 @@ and Key Value exist:
    **Build Command:** `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`
    **Start Command:** `poetry run python -m backend.workflows.main`
 3. Give it the same DB / Redis / secret wiring as the backend (`DATABASE_URL` +
-   `DIRECT_URL` with `?schema=platform`, `REDIS_*`, `REDIS_CLUSTER_MODE=false`,
-   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY`, and
-   **`ENCRYPTION_KEY` copied from the `autogpt-platform-secrets` group**, plus provider API
-   keys your graphs use).
+   `DIRECT_URL` with `?schema=platform`, `REDIS_URL` from the Key Value connection string
+   (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
+   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY`, and the **same
+   deployer-generated `ENCRYPTION_KEY` you set on the backend services** (confirm the boot
+   fingerprint matches), plus provider API keys your graphs use).
 4. Deploy it, copy its slug (task id shows as `{slug}/run_graph_execution`).
 5. Set `RENDER_WORKFLOW_SLUG` (+ `RENDER_API_KEY`, `EXECUTION_BACKEND=workflows`) on
    `rest-server` and `scheduler-server`, then redeploy those two.

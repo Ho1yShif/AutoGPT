@@ -60,6 +60,13 @@ def run_graph_execution(graph_exec_id: str, user_id: str) -> dict[str, str]:
             f"[Workflows] Missing stored entry for graph_exec_id={graph_exec_id}; "
             "cannot run (blob expired or never written)."
         )
+        # This returns BEFORE the try/finally that normally releases the slot, so
+        # release it here — otherwise the slot reserved at dispatch leaks until
+        # the 25h stale-sweep, silently costing the user a concurrency slot for a
+        # day. (The skipped_locked branch below is different: the *owning* run
+        # holds that slot and must keep it.)
+        rate_limit.release_run_slot_sync(user_id, graph_exec_id)
+        cancel_mod.clear_cancel(graph_exec_id)
         return {"graph_exec_id": graph_exec_id, "status": "skipped_no_entry"}
 
     # Idempotency guard: cluster-wide lock so a duplicate dispatch of the same

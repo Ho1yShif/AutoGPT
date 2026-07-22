@@ -34,7 +34,13 @@ def _key(graph_exec_id: str) -> str:
 
 
 async def request_cancel(graph_exec_id: str) -> None:
-    """Set the cooperative cancel flag (called by the producer/stop path)."""
+    """Set the cooperative cancel flag (called by the producer/stop path).
+
+    UNAUTHENTICATED by design: it flips a Redis flag for whatever
+    ``graph_exec_id`` it's handed and performs no ownership check. Callers MUST
+    authorize that the requesting user owns ``graph_exec_id`` first (see
+    ``stop_graph_execution``, which verifies ownership before calling this).
+    """
     r = await redis.get_redis_async()
     await r.set(_key(graph_exec_id), "1", ex=RUN_ARTIFACT_TTL_SECONDS)
 

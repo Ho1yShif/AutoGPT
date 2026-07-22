@@ -239,8 +239,13 @@ projects:
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
               - key: REDIS_PORT
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
-              - key: REDIS_PASSWORD
-                value: ""
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
               - key: REDIS_CLUSTER_MODE
                 value: "false"
               # --- Scheduler RPC client -----------------------------------
@@ -267,12 +272,20 @@ projects:
               - key: CLAMAV_MAX_CONCURRENCY
                 value: "5"
               # --- Auth / JWT (config.py hard-fails on empty JWT_VERIFY_KEY) -
-              # JWT_VERIFY_KEY, ENCRYPTION_KEY, UNSUBSCRIBE_SECRET_KEY come from
-              # the shared group below (wholesale import).
+              # JWT_VERIFY_KEY, UNSUBSCRIBE_SECRET_KEY come from the shared
+              # group below (wholesale import). ENCRYPTION_KEY is set per-service
+              # (see below) because sync:false is ignored inside groups.
               - key: JWT_SIGN_ALGORITHM
                 value: HS256
-              # --- ENCRYPTION_KEY: must match the executor Workflow + all
-              #     backend services (comes from the shared group). See README.
+              # ENCRYPTION_KEY: Fernet cipher key for stored credentials.
+              # sync:false (deployer-supplied) NOT generateValue — Render's
+              # generated secret is not guaranteed to be a valid url-safe-base64
+              # Fernet key. MUST be the IDENTICAL value on every backend service
+              # + the executor Workflow. Generate one, paste everywhere; each
+              # service logs a non-secret fingerprint at boot to spot mismatches.
+              # See README.
+              - key: ENCRYPTION_KEY
+                sync: false
               # --- URLs / CORS / env --------------------------------------
               - key: APP_ENV
                 value: prod
@@ -282,7 +295,7 @@ projects:
                 sync: false             # DEPLOYER: frontend public origin
               - key: BACKEND_CORS_ALLOW_ORIGINS
                 sync: false             # DEPLOYER: JSON array, e.g. ["https://<frontend>"]
-              # --- Shared secrets group (JWT_VERIFY_KEY, ENCRYPTION_KEY, ...) -
+              # --- Shared secrets group (JWT_VERIFY_KEY, UNSUBSCRIBE_SECRET_KEY) -
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -314,8 +327,13 @@ projects:
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
               - key: REDIS_PORT
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
-              - key: REDIS_PASSWORD
-                value: ""
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
               - key: REDIS_CLUSTER_MODE
                 value: "false"
               - key: ENABLE_AUTH
@@ -326,6 +344,8 @@ projects:
                 value: prod
               - key: BACKEND_CORS_ALLOW_ORIGINS
                 sync: false             # DEPLOYER: same value as rest-server
+              - key: ENCRYPTION_KEY
+                sync: false             # IDENTICAL to rest-server (see rest-server note)
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -368,8 +388,13 @@ projects:
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
               - key: REDIS_PORT
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
-              - key: REDIS_PASSWORD
-                value: ""
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
               - key: REDIS_CLUSTER_MODE
                 value: "false"
               - key: EXECUTION_BACKEND
@@ -380,6 +405,8 @@ projects:
                 sync: false             # same value as rest-server (post-Workflow)
               - key: APP_ENV
                 value: prod
+              - key: ENCRYPTION_KEY
+                sync: false             # IDENTICAL to rest-server (see rest-server note)
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -415,12 +442,19 @@ projects:
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
               - key: REDIS_PORT
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
-              - key: REDIS_PASSWORD
-                value: ""
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
               - key: REDIS_CLUSTER_MODE
                 value: "false"
               - key: APP_ENV
                 value: prod
+              - key: ENCRYPTION_KEY
+                sync: false             # IDENTICAL to rest-server (see rest-server note)
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -450,6 +484,12 @@ projects:
               - key: NEXT_PUBLIC_AGPT_WS_SERVER_URL
                 sync: false             # DEPLOYER: wss://<websocket-server host>/ws
               # --- Private backend URL for SSR (skips public round-trip) ---
+              # NOTE: :10000 MUST equal rest-server's internal $PORT. Render
+              # Blueprints can't concatenate scheme + hostport + "/api", so this
+              # is spelled out literally; if rest-server's $PORT ever changes,
+              # update this port too (or switch the frontend to read a bare
+              # `fromService rest-server hostport` and build the URL in app
+              # config). See README.
               - key: AGPT_SERVER_URL
                 value: http://rest-server:10000/api
               # --- Auth: supabase-js hits this frontend's own origin, which
@@ -474,19 +514,16 @@ projects:
 # service (above), NOT here.
 #   * JWT_VERIFY_KEY ...... HS256 secret; also copied into GoTrue's
 #                           GOTRUE_JWT_SECRET via fromService envVarKey.
-#   * ENCRYPTION_KEY ...... Fernet cipher key for stored credentials. MUST be
-#                           identical on the executor Workflow (set by hand in
-#                           the Dashboard to this group's value). VERIFY the
-#                           generated value is a valid url-safe-base64 32-byte
-#                           Fernet key on first deploy — see README.
 #   * UNSUBSCRIBE_SECRET_KEY  signs email unsubscribe links.
+# NOTE: ENCRYPTION_KEY is deliberately NOT in this group. It must be a valid
+# url-safe-base64 Fernet key, which generateValue does not guarantee, and
+# sync:false is ignored inside groups — so it is set per-service as sync:false
+# (deployer-supplied). See the rest-server note above and the README.
 # ==========================================================================
 envVarGroups:
   - name: autogpt-platform-secrets
     envVars:
       - key: JWT_VERIFY_KEY
-        generateValue: true
-      - key: ENCRYPTION_KEY
         generateValue: true
       - key: UNSUBSCRIBE_SECRET_KEY
         generateValue: true

@@ -183,7 +183,16 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         default=25,
         ge=1,
         le=1000,
-        description="Maximum number of concurrent graph executions allowed per user per graph.",
+        description=(
+            "Maximum number of concurrent graph executions allowed per user. "
+            "NOTE: the enforced scope differs by EXECUTION_BACKEND. On 'rabbitmq' "
+            "it is counted per (user_id, graph_id) of RUNNING executions at "
+            "consume time (executor/manager.py); on 'workflows' it is a per-user "
+            "global slot pool enforced at dispatch time "
+            "(workflows/rate_limit.acquire_run_slot). Keep this in mind when "
+            "tuning: the same value is stricter on the workflows path (one pool "
+            "across all graphs) than on the rabbitmq path (one budget per graph)."
+        ),
     )
     execution_backend: Literal["rabbitmq", "workflows"] = Field(
         default="rabbitmq",

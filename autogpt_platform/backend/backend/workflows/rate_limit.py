@@ -33,11 +33,20 @@ def _pool_key(user_id: str) -> str:
     return f"wf:run_slots:{{{user_id}}}"
 
 
-async def acquire_run_slot(user_id: str, graph_exec_id: str) -> bool:
-    """Reserve a concurrency slot for the user. Returns False if at capacity."""
+async def acquire_run_slot(user_id: str, graph_exec_id: str) -> SlotAdmission:
+    """Reserve a concurrency slot for the user.
+
+    Returns the raw :class:`SlotAdmission` outcome so the caller can honor the
+    release contract: only a caller that newly ``ADMITTED`` a slot owns its
+    release. A ``REFRESHED`` result means the slot is already held by the
+    still-running original run (e.g. a resume/requeue of the same
+    ``graph_exec_id``) — that caller must NOT release it on dispatch failure,
+    or it would ``zrem`` a slot the running execution still depends on and
+    under-count the user. ``REJECTED`` means the pool was full.
+    """
     now = time.time()
     r = await redis.get_redis_async()
-    admission = await try_acquire_concurrency_slot(
+    return await try_acquire_concurrency_slot(
         r,
         pool_key=_pool_key(user_id),
         slot_id=graph_exec_id,
@@ -46,7 +55,6 @@ async def acquire_run_slot(user_id: str, graph_exec_id: str) -> bool:
         stale_before_score=now - RUN_ARTIFACT_TTL_SECONDS,
         ttl_seconds=RUN_ARTIFACT_TTL_SECONDS,
     )
-    return admission != SlotAdmission.REJECTED
 
 
 async def release_run_slot(user_id: str, graph_exec_id: str) -> None:
