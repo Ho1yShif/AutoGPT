@@ -1063,10 +1063,12 @@ async def stop_graph_execution(
     Stop a graph execution and optionally all its child executions.
 
     Mechanism:
-    1. Set the cancel event for this execution
-    2. If cascade=True, recursively stop all child executions
-    3. Graph executor's cancel handler thread detects the event, terminates workers,
-       reinitializes worker pool, and returns.
+    1. Authorize the caller, then signal cancellation cooperatively — set the
+       polled Redis cancel flag (`wf_cancel.request_cancel`) on the workflows
+       backend, or publish the RabbitMQ cancel fan-out on the broker backend.
+    2. If cascade=True, recursively stop all child executions.
+    3. The executor detects the signal, terminates workers, reinitializes the
+       worker pool, and returns.
     4. Update execution statuses in DB and set `error` outputs to `"TERMINATED"`.
 
     Args:
@@ -1238,18 +1240,30 @@ async def _dispatch_via_workflows(
     # to the still-running original run (resume/requeue of the same exec id);
     # releasing it on dispatch failure would drop a slot that run still needs.
     owns_slot = admission == SlotAdmission.ADMITTED
+    render_run_id: str | None = None
     try:
         await wf_entry_store.store_execution_entry(graph_exec_entry)
         render_run_id = await wf_client.dispatch_graph_execution(graph_exec_id, user_id)
+        # A returned run id is the point of no return: the task is now (about to
+        # be) RUNNING. Persist the id as the LAST fallible step so a failure here
+        # is handled as "already dispatched" below, not as "release the slot".
         await edb.set_render_run_id(graph_exec_id, render_run_id)
         logger.info(
             f"Dispatched execution {graph_exec_id} to Render Workflows "
             f"(run_id={render_run_id})"
         )
     except BaseException:
-        # Free the reserved slot so a failed dispatch doesn't leak capacity —
-        # but never release a slot the still-running original run owns.
-        if owns_slot:
+        if render_run_id is not None:
+            # Dispatch already returned a run id, so the task is running and holds
+            # the slot — releasing it would under-count the cap. Worse, if
+            # `set_render_run_id` was the failing step the id was never persisted,
+            # so the normal stop-path hard-kill fallback (get_render_run_id) could
+            # never cancel it. Best-effort hard-cancel the orphaned run instead;
+            # its own `finally` (or the run-artifact TTL) reclaims the slot/entry.
+            await wf_client.cancel_graph_execution_run(render_run_id)
+        elif owns_slot:
+            # Failed before dispatch returned an id: free the slot we reserved
+            # (but never release a slot the still-running original run owns).
             await wf_rate_limit.release_run_slot(user_id, graph_exec_id)
         raise
 

@@ -81,8 +81,10 @@ COPY --from=builder /usr/bin/npm /usr/bin/npm
 # Copy Prisma binaries
 COPY --from=builder /root/.cache/prisma-python/binaries /root/.cache/prisma-python/binaries
 
-# Install prisma-client-py directly (much smaller than copying full venv)
-RUN pip3 install prisma>=0.15.0 --break-system-packages
+# Install prisma-client-py directly (much smaller than copying full venv).
+# Pinned to the exact version in poetry.lock so the migrate stage can't silently
+# drift onto a newer, untested Prisma than the app/server stage was built with.
+RUN pip3 install prisma==0.15.0 --break-system-packages
 
 COPY autogpt_platform/backend/schema.prisma ./
 COPY autogpt_platform/backend/backend/data/partial_types.py ./backend/data/partial_types.py

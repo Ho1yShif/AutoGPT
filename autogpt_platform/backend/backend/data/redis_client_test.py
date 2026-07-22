@@ -3,6 +3,7 @@
 Patches the redis-py constructors + ``ping()`` so no real Redis is needed.
 """
 
+import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -187,16 +188,22 @@ async def test_disconnect_async_no_cached_client_is_noop() -> None:
 # Skipped when no cluster is reachable so CI without docker doesn't flap.
 
 
-def _has_live_cluster() -> bool:
+def _port_open(host: str, port: int, timeout: float = 0.25) -> bool:
+    """Cheap liveness probe: is a TCP listener accepting on host:port?
+
+    Used at COLLECTION time to gate integration tests. Must not go through
+    ``connect()`` — that is ``@conn_retry``-wrapped and burns the full backoff
+    budget on every collection when no Redis is running (including CI).
+    """
     try:
-        c = redis_client.connect()
-    except Exception:  # noqa: BLE001 — any connect failure → skip the test
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
         return False
-    try:
-        c.close()
-    except Exception:
-        pass
-    return True
+
+
+def _has_live_cluster() -> bool:
+    return _port_open(redis_client.HOST, redis_client.PORT)
 
 
 @pytest.mark.skipif(
@@ -343,17 +350,7 @@ def test_resolve_shard_for_channel_standalone_returns_host_port_directly() -> No
 
 
 def _has_live_standalone() -> bool:
-    with patch.object(redis_client, "CLUSTER_MODE", False):
-        try:
-            redis_client.get_redis.cache_clear()
-            c = redis_client.connect()
-        except Exception:  # noqa: BLE001 — any connect failure → skip
-            return False
-        try:
-            c.close()
-        except Exception:
-            pass
-    return True
+    return _port_open(redis_client.HOST, redis_client.PORT)
 
 
 @pytest.mark.skipif(

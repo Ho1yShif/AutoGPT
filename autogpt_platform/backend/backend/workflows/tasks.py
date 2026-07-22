@@ -30,6 +30,29 @@ from backend.workflows.constants import MAX_RUN_SECONDS, TASK_NAME
 logger = logging.getLogger(__name__)
 settings = Settings()
 
+# One ExecutionProcessor per worker thread, initialized once and reused across
+# task runs — mirroring the RabbitMQ path's `init_worker` / `_tls` model
+# (engine.py). `on_graph_executor_start` spins up two daemon event-loop threads;
+# constructing a fresh processor per run would leak 2 threads + 2 event loops +
+# their FDs on any process the SDK reuses. Render Workflows runs each production
+# run in its own instance (process exits after one run), but the long-lived local
+# `render workflows dev` server reuses one process across many runs — so the
+# processor MUST be process/thread-scoped, not per-invocation. Thread-local (not
+# module-global) so concurrent runs on separate worker threads never share one
+# processor's loops.
+_tls = threading.local()
+
+
+def _get_processor() -> ExecutionProcessor:
+    """Return this thread's ExecutionProcessor, starting it once on first use."""
+    processor = getattr(_tls, "processor", None)
+    if processor is None:
+        processor = ExecutionProcessor()
+        processor.on_graph_executor_start()
+        _tls.processor = processor
+    return processor
+
+
 # Retries DISABLED: pre-flight billing is not idempotent for a node that was
 # already RUNNING when a run died (the engine re-enqueues + re-charges it on
 # resume). Recovery is a deliberate admin requeue, not an automatic retry.
@@ -79,10 +102,25 @@ def run_graph_execution(graph_exec_id: str, user_id: str) -> dict[str, str]:
         timeout=settings.config.cluster_lock_timeout,
     )
     owner = cluster_lock.try_acquire()
+    if owner is None:
+        # Indeterminate: try_acquire returns None only when Redis errored (or a
+        # rare set/get race) — NOT a genuine foreign owner. Returning a
+        # success-shaped `skipped_locked` here would silently strand the run
+        # (QUEUED/RUNNING forever, no requeue, retries disabled). Release the
+        # slot we can't use and raise so the run surfaces as failed for the
+        # admin-requeue path instead.
+        rate_limit.release_run_slot_sync(user_id, graph_exec_id)
+        cancel_mod.clear_cancel(graph_exec_id)
+        raise RuntimeError(
+            f"[Workflows] Could not acquire exec lock for {graph_exec_id}: "
+            "Redis unavailable or indeterminate. Failing the run for requeue."
+        )
     if owner != executor_id:
+        # Genuine foreign owner (duplicate dispatch of the same exec id): the
+        # OWNING run holds the concurrency slot, so we must NOT release it here.
         logger.warning(
             f"[Workflows] Skipping {graph_exec_id}: already owned by {owner} "
-            "(duplicate dispatch or Redis unavailable)."
+            "(duplicate dispatch)."
         )
         return {"graph_exec_id": graph_exec_id, "status": "skipped_locked"}
 
@@ -90,8 +128,7 @@ def run_graph_execution(graph_exec_id: str, user_id: str) -> dict[str, str]:
     poller_stop = threading.Event()
     poller = cancel_mod.start_cancel_poller(graph_exec_id, cancel_event, poller_stop)
 
-    processor = ExecutionProcessor()
-    processor.on_graph_executor_start()
+    processor = _get_processor()
 
     try:
         # Cooperative: engine flips DB status (TERMINATED on cancel), cleans up

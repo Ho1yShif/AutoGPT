@@ -1957,6 +1957,51 @@ async def test_rejected_slot_raises_rate_limit_and_never_dispatches(
     release.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_post_dispatch_failure_cancels_run_and_keeps_slot(
+    mocker: MockerFixture,
+):
+    """If dispatch returns a run id but the subsequent set_render_run_id write
+    fails, the task is already RUNNING: the slot must NOT be released (that would
+    under-count the cap), and the orphaned run must be best-effort hard-cancelled
+    (its run id may never have been persisted for the normal stop path)."""
+    from types import SimpleNamespace
+
+    from backend.data.redis_helpers import SlotAdmission
+    from backend.executor.utils import _dispatch_via_workflows
+
+    mocker.patch(
+        "backend.workflows.rate_limit.acquire_run_slot",
+        new=mocker.AsyncMock(return_value=SlotAdmission.ADMITTED),
+    )
+    mocker.patch(
+        "backend.workflows.entry_store.store_execution_entry",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch(
+        "backend.workflows.client.dispatch_graph_execution",
+        new=mocker.AsyncMock(return_value="render-run-1"),
+    )
+    cancel_run = mocker.patch(
+        "backend.workflows.client.cancel_graph_execution_run",
+        new=mocker.AsyncMock(),
+    )
+    release = mocker.patch(
+        "backend.workflows.rate_limit.release_run_slot",
+        new=mocker.AsyncMock(),
+    )
+    entry = SimpleNamespace(graph_exec_id="exec-1")
+    edb = SimpleNamespace(
+        set_render_run_id=mocker.AsyncMock(side_effect=RuntimeError("db blip"))
+    )
+
+    with pytest.raises(RuntimeError, match="db blip"):
+        await _dispatch_via_workflows(entry, "user-1", edb)
+
+    cancel_run.assert_awaited_once_with("render-run-1")
+    release.assert_not_called()
+
+
 # ── Item 3: stop_graph_execution ownership check ──────────────────────────
 
 

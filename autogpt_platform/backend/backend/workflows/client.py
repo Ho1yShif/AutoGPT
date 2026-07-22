@@ -10,12 +10,29 @@ blocking the event loop.
 import asyncio
 import logging
 from functools import cache
+from typing import Protocol
 
 from backend.util.settings import Settings
 from backend.workflows.constants import TASK_NAME
 
 logger = logging.getLogger(__name__)
 settings = Settings()
+
+
+class _RunHandle(Protocol):
+    """Structural type for the SDK's started-task handle.
+
+    Annotates the untyped `render_sdk` boundary without importing it on the
+    RabbitMQ path. Only `.id` (the run id) is read here.
+    """
+
+    id: str
+
+
+def reset_client() -> None:
+    """Drop the memoized SDK client. Test teardown hook for the ``@cache`` below;
+    a no-op in production (the client is meant to live for the process)."""
+    _get_client.cache_clear()
 
 
 def _task_slug() -> str:
@@ -50,7 +67,7 @@ async def dispatch_graph_execution(graph_exec_id: str, user_id: str) -> str:
 
     def _start() -> str:
         client = _get_client()
-        run = client.workflows.start_task(slug, [graph_exec_id, user_id])
+        run: _RunHandle = client.workflows.start_task(slug, [graph_exec_id, user_id])
         return run.id
 
     run_id = await asyncio.to_thread(_start)

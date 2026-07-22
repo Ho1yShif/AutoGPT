@@ -54,32 +54,43 @@ def _get_redis() -> RedisCluster | Redis:
     (``REDIS_CLUSTER_MODE=false``, e.g. Render Key Value) builds a plain
     ``Redis`` client against the single node.
     """
-    # Local import breaks the redis_client <-> cache module cycle.
-    from backend.data.redis_client import CLUSTER_MODE, _address_remap
+    # Local import breaks the redis_client <-> cache module cycle. Reuse
+    # redis_client's resolved connection info so the shared cache and the main
+    # client connect identically (same REDIS_URL / TLS / host:port).
+    from backend.data.redis_client import CLUSTER_MODE, PASSWORD, REDIS_URL
+    from backend.data.redis_client import HOST as REDIS_HOST
+    from backend.data.redis_client import PORT as REDIS_PORT
+    from backend.data.redis_client import _address_remap
 
+    # `password` is NOT in `common`: passing password=None to `from_url` would
+    # clobber credentials embedded in the URL. It's added per-branch instead
+    # (mirroring redis_client.connect()).
+    common = dict(
+        decode_responses=False,  # Binary mode for pickle
+        max_connections=50,
+        socket_keepalive=True,
+        socket_connect_timeout=5,
+        retry_on_timeout=True,
+    )
     if not CLUSTER_MODE:
-        client: RedisCluster | Redis = Redis(
-            host=settings.config.redis_host,
-            port=settings.config.redis_port,
-            password=settings.config.redis_password or None,
-            decode_responses=False,  # Binary mode for pickle
-            max_connections=50,
-            socket_keepalive=True,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
-        )
+        if REDIS_URL:
+            # Resolve host/port/password (and rediss:// TLS) from the URL, exactly
+            # like redis_client. The split-var path has no `ssl` knob, so
+            # standalone TLS requires a rediss:// REDIS_URL.
+            client: RedisCluster | Redis = Redis.from_url(REDIS_URL, **common)
+        else:
+            client = Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                password=PASSWORD,
+                **common,
+            )
     else:
         client = RedisCluster(
-            startup_nodes=[
-                ClusterNode(settings.config.redis_host, settings.config.redis_port)
-            ],
-            password=settings.config.redis_password or None,
-            decode_responses=False,  # Binary mode for pickle
-            max_connections=50,
-            socket_keepalive=True,
-            socket_connect_timeout=5,
-            retry_on_timeout=True,
+            startup_nodes=[ClusterNode(REDIS_HOST, REDIS_PORT)],
+            password=PASSWORD,
             address_remap=_address_remap,
+            **common,
         )
     client.ping()
     return client

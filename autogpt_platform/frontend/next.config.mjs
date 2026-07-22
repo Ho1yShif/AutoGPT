@@ -57,10 +57,16 @@ const nextConfig = {
     "require-in-the-middle",
   ],
   experimental: {
+    // Body-size ceiling for Server Actions / middleware routes. Kept modest to
+    // limit the memory-exhaustion (DoS) surface on a public deploy — a 256 MB
+    // cap on every route lets an unauthenticated caller pin server memory.
+    // 50 MB matches the ClamAV StreamMaxLength (see render.yaml) — the effective
+    // upload-scan ceiling — so uploads that would pass scanning still fit. If a
+    // deploy needs larger uploads, raise this AND the ClamAV limits together.
     serverActions: {
-      bodySizeLimit: "256mb",
+      bodySizeLimit: "50mb",
     },
-    middlewareClientMaxBodySize: "256mb",
+    middlewareClientMaxBodySize: "50mb",
     // Limit parallel webpack workers to reduce peak memory during builds.
     cpus: 2,
   },
@@ -93,18 +99,18 @@ const nextConfig = {
     return config;
   },
   images: {
-    domains: [
-      // We dont need to maintain alphabetical order here
-      // as we are doing logical grouping of domains
-      "images.unsplash.com",
-      "ddz4ak4pa3d19.cloudfront.net",
-      "upload.wikimedia.org",
-      "storage.googleapis.com",
-
-      "ideogram.ai", // for generated images
-      "example.com", // for local test data images
-    ],
+    // `domains` is deprecated in Next.js — every allowed host is expressed as a
+    // `remotePatterns` entry instead. Test-only hosts (example.com) are dropped
+    // so they don't ship in a production config.
     remotePatterns: [
+      { protocol: "https", hostname: "images.unsplash.com", pathname: "/**" },
+      {
+        protocol: "https",
+        hostname: "ddz4ak4pa3d19.cloudfront.net",
+        pathname: "/**",
+      },
+      { protocol: "https", hostname: "upload.wikimedia.org", pathname: "/**" },
+      { protocol: "https", hostname: "ideogram.ai", pathname: "/**" },
       {
         protocol: "https",
         hostname: "storage.googleapis.com",
@@ -143,6 +149,12 @@ const nextConfig = {
         headers: [
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          // Force HTTPS for a year on this host + subdomains (Render terminates
+          // TLS). Not preloaded — leave that opt-in to the deployer's domain.
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=31536000; includeSubDomains",
+          },
           // Enables Sentry browser JS self-profiling.
           { key: "Document-Policy", value: "js-profiling" },
         ],

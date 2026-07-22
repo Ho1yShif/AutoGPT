@@ -143,6 +143,8 @@ projects:
                   name: autogpt-platform-db
                   property: connectionString
               # --- JWT (HS256 shared secret; == backend JWT_VERIFY_KEY) -----
+              # Pulls rest-server's SERVICE-LEVEL generateValue (not a group value),
+              # so this resolves reliably; a mismatch here breaks all auth.
               - key: GOTRUE_JWT_SECRET
                 fromService:
                   name: rest-server
@@ -221,8 +223,14 @@ projects:
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
               exec env AGENT_API_PORT=$PORT rest'
             healthCheckPath: /health
+            # Prisma resolves BOTH datasource env refs (url=DATABASE_URL and
+            # directUrl=DIRECT_URL) at schema load — even though `migrate deploy`
+            # connects via DIRECT_URL. So DATABASE_URL must be present too, or the
+            # first deploy fails with "Environment variable not found: DATABASE_URL".
+            # Mirror the dockerCommand, which already exports both.
             preDeployCommand: >-
-              /bin/sh -c 'export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
               prisma migrate deploy'
             envVars:
               # --- Postgres ------------------------------------------------
@@ -272,9 +280,16 @@ projects:
               - key: CLAMAV_MAX_CONCURRENCY
                 value: "5"
               # --- Auth / JWT (config.py hard-fails on empty JWT_VERIFY_KEY) -
-              # JWT_VERIFY_KEY, UNSUBSCRIBE_SECRET_KEY come from the shared
-              # group below (wholesale import). ENCRYPTION_KEY is set per-service
-              # (see below) because sync:false is ignored inside groups.
+              # rest-server OWNS the HS256 secret: a service-level generateValue.
+              # Every other consumer (ws, scheduler, database-manager, and GoTrue's
+              # GOTRUE_JWT_SECRET) pulls THIS value via `fromService envVarKey`.
+              # It is deliberately NOT in the shared group: a group→service→service
+              # `fromService` chain is not reliably resolvable in Blueprints, and a
+              # silent mismatch means GoTrue signs tokens the backend can't verify.
+              # Referencing a service-level generateValue is the reliable pattern.
+              # UNSUBSCRIBE_SECRET_KEY still comes from the group below.
+              - key: JWT_VERIFY_KEY
+                generateValue: true
               - key: JWT_SIGN_ALGORITHM
                 value: HS256
               # ENCRYPTION_KEY: Fernet cipher key for stored credentials.
@@ -295,7 +310,7 @@ projects:
                 sync: false             # DEPLOYER: frontend public origin
               - key: BACKEND_CORS_ALLOW_ORIGINS
                 sync: false             # DEPLOYER: JSON array, e.g. ["https://<frontend>"]
-              # --- Shared secrets group (JWT_VERIFY_KEY, UNSUBSCRIBE_SECRET_KEY) -
+              # --- Shared secrets group (UNSUBSCRIBE_SECRET_KEY) ----------
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -338,6 +353,10 @@ projects:
                 value: "false"
               - key: ENABLE_AUTH
                 value: "true"
+              # HS256 secret — pull rest-server's service-level generateValue
+              # (owner) so both verify with the identical key. See rest-server.
+              - key: JWT_VERIFY_KEY
+                fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
               - key: JWT_SIGN_ALGORITHM
                 value: HS256
               - key: APP_ENV
@@ -403,6 +422,10 @@ projects:
                 sync: false
               - key: RENDER_WORKFLOW_SLUG
                 sync: false             # same value as rest-server (post-Workflow)
+              # HS256 secret — config hard-fails on an empty JWT_VERIFY_KEY, so
+              # pull rest-server's service-level generateValue (owner).
+              - key: JWT_VERIFY_KEY
+                fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
               - key: APP_ENV
                 value: prod
               - key: ENCRYPTION_KEY
@@ -451,6 +474,10 @@ projects:
                 fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
               - key: REDIS_CLUSTER_MODE
                 value: "false"
+              # HS256 secret — config hard-fails on an empty JWT_VERIFY_KEY, so
+              # pull rest-server's service-level generateValue (owner).
+              - key: JWT_VERIFY_KEY
+                fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
               - key: APP_ENV
                 value: prod
               - key: ENCRYPTION_KEY
@@ -512,9 +539,12 @@ projects:
 # generateValue is created ONCE and persists across syncs. sync:false is
 # IGNORED inside groups, so every Dashboard-prompt secret lives on its
 # service (above), NOT here.
-#   * JWT_VERIFY_KEY ...... HS256 secret; also copied into GoTrue's
-#                           GOTRUE_JWT_SECRET via fromService envVarKey.
 #   * UNSUBSCRIBE_SECRET_KEY  signs email unsubscribe links.
+# NOTE: JWT_VERIFY_KEY is deliberately NOT in this group. GoTrue/ws/scheduler/
+# database-manager pull it via `fromService envVarKey: JWT_VERIFY_KEY` from
+# rest-server, and a group→service→service `fromService` chain is not reliably
+# resolvable in Blueprints. It is a SERVICE-LEVEL generateValue on rest-server
+# (the owner) instead. See the rest-server JWT note above.
 # NOTE: ENCRYPTION_KEY is deliberately NOT in this group. It must be a valid
 # url-safe-base64 Fernet key, which generateValue does not guarantee, and
 # sync:false is ignored inside groups — so it is set per-service as sync:false
@@ -523,7 +553,5 @@ projects:
 envVarGroups:
   - name: autogpt-platform-secrets
     envVars:
-      - key: JWT_VERIFY_KEY
-        generateValue: true
       - key: UNSUBSCRIBE_SECRET_KEY
         generateValue: true

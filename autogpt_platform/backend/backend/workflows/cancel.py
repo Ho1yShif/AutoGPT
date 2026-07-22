@@ -74,9 +74,10 @@ def start_cancel_poller(
                     return
             except Exception as e:
                 # Never let a transient Redis hiccup kill the run; try again.
-                # Leave a breadcrumb so a persistent failure (e.g. Redis down for
-                # the whole run, silently disabling cancellation) is observable.
-                logger.debug("cancel poll failed for %s: %s", graph_exec_id, e)
+                # Log at WARNING (not debug): a run that can no longer observe the
+                # cancel flag is silently un-cancellable, which MUST be visible in
+                # default (INFO) logging — see the "observable" note above.
+                logger.warning("cancel poll failed for %s: %s", graph_exec_id, e)
             time.sleep(_POLL_INTERVAL_SECONDS)
 
     thread = threading.Thread(target=_poll, daemon=True)

@@ -1367,6 +1367,7 @@ class TestStandaloneSharedCacheRedis:
     def test_get_redis_standalone_builds_plain_redis(self) -> None:
         with (
             patch.object(redis_client, "CLUSTER_MODE", False),
+            patch.object(redis_client, "REDIS_URL", None),
             patch.object(cache_module, "Redis", autospec=True) as mock_redis,
             patch.object(cache_module, "RedisCluster", autospec=True) as mock_cluster,
         ):
@@ -1377,8 +1378,29 @@ class TestStandaloneSharedCacheRedis:
         mock_cluster.assert_not_called()
         kwargs = mock_redis.call_args.kwargs
         assert kwargs["decode_responses"] is False  # binary mode for pickle
+        assert kwargs["password"] == redis_client.PASSWORD
         assert "startup_nodes" not in kwargs
         assert "address_remap" not in kwargs
+
+    def test_get_redis_standalone_prefers_redis_url(self) -> None:
+        """When REDIS_URL is set (e.g. Render Key Value connectionString), the
+        shared cache must build from the URL — same as redis_client — so embedded
+        creds and rediss:// TLS are honored. `password` must NOT be forced as a
+        kwarg (it would clobber the URL's credentials)."""
+        url = "rediss://user:pw@keyvalue.internal:6380/0"
+        with (
+            patch.object(redis_client, "CLUSTER_MODE", False),
+            patch.object(redis_client, "REDIS_URL", url),
+            patch.object(cache_module, "Redis", autospec=True) as mock_redis,
+        ):
+            mock_redis.from_url.return_value = MagicMock(spec=Redis)
+            cache_module._get_redis()
+
+        mock_redis.from_url.assert_called_once()
+        assert mock_redis.from_url.call_args.args[0] == url
+        assert "password" not in mock_redis.from_url.call_args.kwargs
+        # The split-var Redis(host=...) constructor path must not be used.
+        mock_redis.assert_not_called()
 
     def test_get_redis_cluster_builds_cluster(self) -> None:
         with (
