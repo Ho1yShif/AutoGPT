@@ -188,6 +188,15 @@ and Key Value exist:
 
 ---
 
+## Local development
+
+To run the stack on your own machine — full Docker or core-in-Docker with the app
+native and hot-reloading — see [`local.md`](local.md). Local dev uses the repo's
+`docker-compose.yml` and the **RabbitMQ** execution backend, **not** Render Workflows
+(`EXECUTION_BACKEND=workflows` is a deploy-only concern handled by `render.yaml`).
+
+---
+
 ## Notes & tradeoffs
 
 - **Region/workspace:** every resource is in `oregon` in one workspace — required for
