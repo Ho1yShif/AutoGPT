@@ -7,8 +7,10 @@ run/cancel messages from RabbitMQ and drives the broker-agnostic engine in
 an alternative front-end to the SAME engine; both are selected at the producer
 side via the `EXECUTION_BACKEND` setting (see `backend/executor/utils.py`).
 
-Engine symbols are re-exported here for backward compatibility so existing
-imports of `backend.executor.manager.<symbol>` keep working.
+Engine symbols are imported directly from `backend.executor.engine`; this module
+imports only what `ExecutionManager` itself uses. Consumers that want engine
+helpers (e.g. `ExecutionProcessor`, `get_db_async_client`) import them from
+`backend.executor.engine` directly.
 """
 
 import asyncio
@@ -29,21 +31,11 @@ from backend.data.execution import ExecutionStatus, GraphExecutionEntry
 from backend.data.rabbitmq import SyncRabbitMQ
 from backend.executor.cost_tracking import drain_pending_cost_logs
 from backend.executor.engine import (
-    ExecutionProcessor,
     active_runs_gauge,
-    async_update_graph_execution_state,
-    async_update_node_execution_status,
     execute_graph,
-    get_db_async_client,
     get_db_client,
-    increment_execution_count,
     init_worker,
     pool_size_gauge,
-    send_async_execution_update,
-    send_execution_update,
-    synchronized,
-    update_graph_execution_state,
-    update_node_execution_status,
     utilization_gauge,
 )
 from backend.util.decorator import error_logged
@@ -62,26 +54,6 @@ from .utils import (
     CancelExecutionEvent,
     create_execution_queue_config,
 )
-
-__all__ = [
-    "ExecutionManager",
-    "ExecutionProcessor",
-    "active_runs_gauge",
-    "async_update_graph_execution_state",
-    "async_update_node_execution_status",
-    "execute_graph",
-    "get_db_async_client",
-    "get_db_client",
-    "increment_execution_count",
-    "init_worker",
-    "pool_size_gauge",
-    "send_async_execution_update",
-    "send_execution_update",
-    "synchronized",
-    "update_graph_execution_state",
-    "update_node_execution_status",
-    "utilization_gauge",
-]
 
 _logger = logging.getLogger(__name__)
 logger = TruncatedLogger(_logger, prefix="[ExecutionManager]")

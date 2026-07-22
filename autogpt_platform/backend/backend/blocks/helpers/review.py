@@ -41,7 +41,7 @@ class HITLReviewHelper:
     @staticmethod
     async def update_node_execution_status(**kwargs) -> None:
         """Update the execution status of a node."""
-        from backend.executor.manager import async_update_node_execution_status
+        from backend.executor.engine import async_update_node_execution_status
 
         await async_update_node_execution_status(
             db_client=get_database_manager_async_client(), **kwargs

@@ -69,7 +69,7 @@ def sync_fail_close_session(
 
     Submits the CAS coroutine to the long-lived *execution_loop* via
     ``run_coroutine_threadsafe`` — the same shape agent-executor uses at
-    :meth:`backend.executor.manager.ExecutionProcessor.on_graph_execution`
+    :meth:`backend.executor.engine.ExecutionProcessor.on_graph_execution`
     to reach its ``node_execution_loop`` from the pool worker. Reusing the
     persistent loop means:
 

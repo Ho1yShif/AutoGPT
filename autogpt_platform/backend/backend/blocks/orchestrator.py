@@ -49,7 +49,7 @@ from backend.util.tool_call_loop import (
 
 if TYPE_CHECKING:
     from backend.data.graph import Link, Node
-    from backend.executor.manager import ExecutionProcessor
+    from backend.executor.engine import ExecutionProcessor
 
 logger = logging.getLogger(__name__)
 

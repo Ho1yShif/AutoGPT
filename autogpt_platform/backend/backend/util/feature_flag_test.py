@@ -243,6 +243,27 @@ class TestUserContextCacheDegradation:
         assert get_user_by_id.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_not_found_user_context_is_cached(self, mocker):
+        """A valid-UUID-but-deleted user id is a STABLE result: ``get_user_by_id``
+        raises ``ValueError``, we return an anonymous context, and ``@cached``
+        stores it — so repeated flag evaluations for that dead id don't re-hit
+        the DB on every call (item 5B)."""
+        get_user_by_id = mocker.patch(
+            "backend.data.user.get_user_by_id",
+            new_callable=AsyncMock,
+            side_effect=ValueError("User not found"),
+        )
+        user_id = str(uuid.uuid4())
+
+        first = await _fetch_user_context_data(user_id)
+        second = await _fetch_user_context_data(user_id)
+
+        assert first.anonymous is True
+        assert second.anonymous is True
+        assert first.get("email") is None
+        get_user_by_id.assert_called_once_with(user_id)
+
+    @pytest.mark.asyncio
     async def test_context_lookup_recovers_after_transient_failure(self, mocker):
         created = datetime.datetime(2026, 5, 7, 12, 0, 0, tzinfo=datetime.timezone.utc)
         user = mocker.MagicMock(email="x@y.com", created_at=created)

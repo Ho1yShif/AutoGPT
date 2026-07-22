@@ -1,474 +1,355 @@
-# Deploy AutoGPT Platform on Render — Build Plan
+# Fix Plan — `feat/render-template-deploy`
 
-Turns `autogpt_platform/` into a Render deploy template: a fresh fork clicks **Deploy
-to Render** and every service comes up green, wired over Render's private network from
-a single `render.yaml`, with no managed RabbitMQ, no Supabase, and no hardcoded hosts.
+Handoff for the next agent. This lists the outstanding issues found in a clean-code
+review of the branch, each with a **conventional solution** and concrete touchpoints.
+Ordered by priority. Items 1–5 are correctness/security; 6–10 are hygiene; 11 is repo
+cleanup.
 
-Source of truth for the target architecture: [`arch.md`](arch.md). Each area below was
-investigated by a dedicated owner agent; the concrete findings, env vars, and code
-touchpoints are folded into the corresponding workstream.
+All paths are relative to `autogpt_platform/backend/` unless noted. Follow
+`backend/AGENTS.md` conventions (top-level imports, Pydantic over dict, `%s` in debug
+logs, early returns). Every fix should ship with a test (TDD: write the failing test
+first — see `backend/AGENTS.md` "Test-Driven Development").
 
-## ⚠️ Findings that change this plan (read first)
+---
 
-The area investigations surfaced three things that contradict the naive arch.md framing:
+## ⇢ HANDOFF STATUS (updated mid-execution)
 
-1. **Auth: keep GoTrue, do NOT rewrite auth into the backend (Stream B). ✅ DECIDED —
-   run the GoTrue container on Render.** The backend only *verifies* JWTs (a shared HMAC
-   secret); it never issues or refreshes sessions, and the `auth.users → platform.User`
-   trigger was already dropped (users are created lazily from JWT claims). The repo
-   already ships a self-hosted **GoTrue** container. The self-issued-JWT rewrite is a
-   rejected alternative, not the plan.
-2. **Redis cluster mode is a hard blocker (Stream A). ✅ RESOLVED — add a standalone
-   client path behind a flag.** The incompatibility is the *client class*, not the data
-   or the pub/sub protocol: `RedisCluster`/`AsyncRedisCluster` issue `CLUSTER SLOTS` on
-   connect, which single-node Render Key Value rejects. Sharded pub/sub
-   (`SSUBSCRIBE`/`SPUBLISH`) is itself supported on standalone Valkey 8, so the fix is a
-   bounded 3-file change gated by `REDIS_CLUSTER_MODE` (default `true`; Render sets
-   `false`). See Stream A for the file-level plan.
-3. **Render Blueprints do not support Workflows (Stream C). ✅ ACCEPTED — Workflow
-   resource created manually in the Dashboard.** arch.md's "everything in one
-   `render.yaml`" cannot include the executor; blueprint services reference it via env
-   vars only.
+**Code changes for items 1–7 and 10 are DONE and pass `ruff check` + `black`.**
+Item 5A was already satisfied in the codebase (the `role`-dropped rationale is
+documented in `util/feature_flag.py`). Item 11 is intentionally DEFERRED (destructive
+file-deletion + git-history squash — do only at the final publish step, per the user).
 
-The consolidated blocker/decision list is in [§ Cross-cutting blockers](#cross-cutting-blockers--decisions).
+| Item | Status | Notes |
+|------|--------|-------|
+| 1 rate_limit slot-release | ✅ done + tested | `acquire_run_slot` returns `SlotAdmission`; `_dispatch_via_workflows` only releases when `ADMITTED`. Tests in `executor/utils_test.py` (`test_refreshed_slot_not_released_on_dispatch_failure`, `test_admitted_slot_released_on_dispatch_failure`, `test_rejected_slot_raises_rate_limit_and_never_dispatches`) — verified red→green by reverting the `owns_slot` guard. |
+| 2 skipped_no_entry leak | ✅ done + tested | release + `clear_cancel` added in `tasks.py` entry-is-None branch. Test in `workflows/tasks_test.py` (`test_skipped_no_entry_releases_slot_and_clears_cancel`). Added `workflows/conftest.py` so workflows unit tests run without the server stack (mirrors `util/conftest.py`). |
+| 3 stop_graph_execution ownership | ✅ done + tested | ownership check added up front (before cascade/cancel), regardless of `wait_timeout`; `request_cancel` doc note added. Test `test_stop_graph_execution_rejects_unowned_before_cancel` — verified red→green by reverting the up-front check. |
+| 4 render.yaml Redis + ENCRYPTION_KEY | ✅ done | `REDIS_URL` wired from Key Value `connectionString` on all 4 backend svcs + `redis_client.py` prefers it (standalone). `ENCRYPTION_KEY` moved OUT of the shared group to per-service `sync:false` (4 svcs); `encryption.py` now fails fast on a bad Fernet key + logs a non-secret boot fingerprint; README updated. **NOTE:** item 4A's original premise was wrong — Render Key Value internal is unauthenticated by default, so the old `REDIS_PASSWORD:""` was not actually broken; the `REDIS_URL` change makes it robust if internal auth is ever enabled. |
+| 5A LD `role` dropped | ✅ pre-existing | already documented in `feature_flag.py`; no change needed. |
+| 5B not-found LD caching | ✅ done + tested | `_fetch_db_user_context` now catches the not-found `ValueError` and returns a (cacheable) anonymous context; transient errors still propagate uncached. Test `feature_flag_test.py::TestUserContextCacheDegradation::test_not_found_user_context_is_cached`. |
+| 6 concurrency-cap semantics | ✅ done | divergence documented on the `Config` field in `settings.py`. |
+| 7 AGPT_SERVER_URL port | ✅ done (documented) | Blueprint can't concatenate scheme+hostport+`/api`; port↔`$PORT` coupling now spelled out in render.yaml. **Fuller fix (frontend reads bare `hostport`, builds URL in app config) NOT done — needs a frontend decision.** |
+| 8 render_sdk in Poetry | ✅ done | Poetry can't capture it — `render_sdk 0.7.0` → `openapi-python-client 0.26.x` hard-pins `ruff<0.14`, irreconcilable with repo `ruff ^0.15` (confirmed against PyPI). Applied the plan's documented fallback: pin + both artifact hashes centralized in `backend/render_sdk.requirements.txt`; Dockerfile installs `--no-deps --require-hashes -r render_sdk.requirements.txt` (reproducible + tamper-evident). |
+| 9 manager `__all__` cleanup | ✅ done | 4 external importers migrated to `backend.executor.engine` (`blocks/orchestrator.py`, `blocks/helpers/review.py`, `api/features/admin/execution_analytics_routes.py`, `executor/automod/manager.py`); `manager.py` engine import trimmed to the 6 symbols it uses internally; `__all__` removed; stale docstring xref in `copilot/executor/processor.py` repointed to `engine`. |
+| 10 typing + redis dedup | ✅ done | `edb` typed via `_RenderRunIdSetter` Protocol; `redis_client.py` shared `common` kwargs + `_env_bool` helper. |
+| 11 remove internal docs | ⛔ DEFERRED | final publish step only. |
 
-## Preflight (owned by the orchestrator, before any agent spawns)
+### What the next agent must still do
+1. **Full `poetry run test`** was NOT run here — this environment has no
+   `autogpt_platform/.env` and the docker infra stack (postgres/redis/rabbitmq) is not
+   provisioned, so the session `server` fixture (autouse `graph_cleanup`) can't start.
+   Run the full suite in a properly provisioned environment before publish. What WAS
+   verified locally:
+   - `ruff check` + `black --check` clean on all 11 changed files.
+   - Items 2 & 5B tests pass under their lightweight conftests (`workflows/`, `util/`).
+   - Items 1 & 3 tests (in `executor/utils_test.py`, which has no server-fixture
+     override) were verified via a **temporary** `executor/conftest.py` override
+     (since removed): confirmed green on the fixed code and red after reverting each
+     fix. To re-run them standalone, temporarily add the same `server`/`graph_cleanup`
+     no-op overrides to `executor/conftest.py`, or just run the full docker-backed suite.
+   - `render blueprints validate` still only YAML-parse-confirmed (CLI not run).
+2. Item 11 at publish time only.
 
-- **render.com/templates check** — confirm Render doesn't already ship an AutoGPT
-  template. If it does, recommend it and stop.
-- **Secret-handling sweep** — scan working tree **and full git history** for real
-  committed credentials and any plaintext-key mechanism (key pasted into a tracked
-  file, secret persisted to DB/disk, secret shipped to the browser, literal secret or
-  `sync: true` in a Blueprint). The `.env.template` hits under `classic/` are
-  placeholder examples (`sk-xxx…`), not real keys — cleared. Re-run the history scan
-  before spawning; if a real key ever surfaces, stop and follow the "copy-not-fork +
-  squash + rotate" remediation in the skill. Note the demo/anon JWT keys in
-  `.env.default` must never ship to Render.
-- **Workspace** — target **shifra-workspace** (`tea-d50tvuidbo4c73cahs30`); select and
-  verify it before creating any resource.
+**Files changed (this session, items 1–3/5B tests + 8 + 9):**
+`executor/utils_test.py` (new tests), `workflows/tasks_test.py` (new),
+`workflows/conftest.py` (new), `util/feature_flag_test.py` (new 5B test),
+`executor/manager.py` (trimmed engine import + removed `__all__`),
+`blocks/orchestrator.py`, `blocks/helpers/review.py`,
+`api/features/admin/execution_analytics_routes.py`, `executor/automod/manager.py`,
+`copilot/executor/processor.py` (import/docstring migrations),
+`backend/render_sdk.requirements.txt` (new, hash-pinned), `backend/Dockerfile`.
 
-## Target topology (what `render.yaml` will declare)
+**Files changed in prior sessions (items 1–7, 10 code):** `workflows/rate_limit.py`,
+`workflows/tasks.py`, `workflows/cancel.py`, `executor/utils.py`, `util/settings.py`,
+`util/feature_flag.py`, `util/encryption.py`, `data/redis_client.py`, plus repo-root
+`render.yaml` and `README.md`.
 
+---
+
+---
+
+## 1. `workflows/rate_limit.py` — slot-release contract is broken
+
+**Problem.** `acquire_run_slot` (line 36) collapses the three-way `SlotAdmission`
+(`ADMITTED` / `REFRESHED` / `REJECTED`) into `admission != REJECTED` and returns a bool.
+The caller `_dispatch_via_workflows` (`executor/utils.py`) releases the slot in its
+`except BaseException` on **any** dispatch failure. When a resume/requeue of an
+already-running `graph_exec_id` takes the `REFRESHED` path (the slot is owned by the
+still-running original run) and dispatch then fails, the cleanup `zrem`s a slot that the
+running execution still depends on — under-counting the user and letting them exceed
+`max_concurrent_graph_executions_per_user`.
+
+Only the caller that **newly `ADMITTED`** a slot owns its release — this is exactly the
+contract documented on `SlotAdmission` in `data/redis_helpers.py:324`.
+
+**Conventional solution.** Preserve the admission outcome across the boundary; release
+only when newly admitted.
+
+- In `rate_limit.py`, return the outcome instead of a bool:
+  ```python
+  async def acquire_run_slot(user_id: str, graph_exec_id: str) -> SlotAdmission:
+      ...
+      return admission  # ADMITTED | REFRESHED | REJECTED
+  ```
+- In `executor/utils.py` `_dispatch_via_workflows`, branch on it and record whether this
+  call owns the slot:
+  ```python
+  admission = await wf_rate_limit.acquire_run_slot(user_id, graph_exec_id)
+  if admission == SlotAdmission.REJECTED:
+      raise wf_rate_limit.ExecutionRateLimitError(...)
+  owns_slot = admission == SlotAdmission.ADMITTED
+  try:
+      ...
+  except BaseException:
+      if owns_slot:  # never release a slot the running original owns
+          await wf_rate_limit.release_run_slot(user_id, graph_exec_id)
+      raise
+  ```
+- Import `SlotAdmission` from `backend.data.redis_helpers` at top level of `utils.py`.
+
+**Test.** Simulate `try_acquire_concurrency_slot` returning `REFRESHED`, force dispatch to
+raise, assert `release_run_slot` is **not** called (mock/spy on `zrem` or the release fn).
+Add a companion test for the `ADMITTED` path asserting release **is** called.
+
+---
+
+## 2. `workflows/tasks.py:64` — concurrency slot leaked on `skipped_no_entry`
+
+**Problem.** The `try/finally` that releases the slot, clears the cancel flag, and
+deletes the entry starts at ~line 90. The `entry is None` early return
+(`return {"graph_exec_id": ..., "status": "skipped_no_entry"}`, line 64) happens **before**
+it. When the entry blob expired or was never written, the slot reserved at dispatch is
+never released and is only reclaimed by the 25h stale-sweep — a user silently loses a
+concurrency slot for a day.
+
+**Conventional solution.** Release the slot (and clear the cancel flag) in the
+`skipped_no_entry` branch before returning. The `skipped_locked` branch (lines ~76–81)
+is correct as-is — the *owning* run keeps its slot.
+
+```python
+if entry is None:
+    logger.error(...)
+    rate_limit.release_run_slot_sync(user_id, graph_exec_id)
+    cancel_mod.clear_cancel(graph_exec_id)
+    return {"graph_exec_id": graph_exec_id, "status": "skipped_no_entry"}
 ```
-                          ┌───────────────────────────┐
-                          │   frontend (node, web)    │  Next.js, public HTTPS
-                          └─────────────┬─────────────┘
-                                        │ HTTPS (NEXT_PUBLIC_* → rest_server URL)
-                                        ▼
-   ┌──────────────────┐   WSS   ┌───────────────────────────┐      ┌──────────────┐
-   │ websocket_server │◀───────▶│   rest_server (docker,web)│─────▶│ gotrue (auth)│
-   │  (docker, web)   │         └───┬───────────┬────────┬───┘      └──────┬───────┘
-   └──────────────────┘             │ SQL       │ cache  │ start_task()    │ SQL
-                                    ▼           ▼        ▼                 │
-                          ┌──────────────┐ ┌──────────┐ ┌────────────────────┐
-                          │ db (postgres)│◀│ keyvalue │ │  Render Workflows  │  (Dashboard-only,
-                          └──────┬───────┘ │ (redis)  │ │  executor @app.task │   not in blueprint)
-                                 └─────────┘└──────────┘ └────────────────────┘
-   ┌──────────────────┐  private     ┌───────────────────────────┐
-   │ scheduler_server │  network     │   clamav (docker, private)│  file scanning
-   │ (docker, private)│◀────────────▶│   reachable from backend  │
-   └──────────────────┘              └───────────────────────────┘
+
+Alternatively, restructure so slot acquisition/release brackets the whole task body via a
+context manager — but the minimal targeted release above is the low-risk fix.
+
+**Test.** Call `run_graph_execution` with no stored entry (mock
+`entry_store.load_execution_entry_sync -> None`); assert `release_run_slot_sync` was
+called and the return status is `skipped_no_entry`.
+
+---
+
+## 3. `executor/utils.py` `stop_graph_execution` — cancel lacks an ownership check
+
+**Problem.** `request_cancel` (workflows path) / the RabbitMQ fan-out publish both fire
+**before** any `user_id` ownership verification, and when `wait_timeout` is falsy the
+function returns immediately afterward — never validating that `user_id` owns
+`graph_exec_id`. The only ownership-scoped read
+(`db.get_graph_execution_meta(execution_id=..., user_id=user_id)`) lives inside the wait
+loop, which is skipped when `wait_timeout` is 0/None. A caller passing an arbitrary
+`graph_exec_id` can terminate another tenant's execution.
+
+This shape is **pre-existing** on the RabbitMQ path; the new workflows path inherits it.
+Fixing it in `stop_graph_execution` closes both.
+
+**Conventional solution.** Verify ownership *first*, before emitting any cancel signal,
+regardless of `wait_timeout`. Reuse the existing lookup:
+
+```python
+graph_exec = await db.get_graph_execution_meta(
+    execution_id=graph_exec_id, user_id=user_id
+)
+if not graph_exec:
+    raise NotFoundError(f"Graph execution #{graph_exec_id} not found.")
+# ...only now emit the cancel signal (request_cancel / publish)...
 ```
 
-All resources grouped under one Render **Project** (`autogpt-platform`), same region +
-workspace (hard precondition for private DNS). Shared secrets (JWT signing secret,
-`OPENAI_API_KEY`, `ENCRYPTION_KEY`, etc.) live in a named **environment group**
-(`autogpt-platform-secrets`), referenced via `fromGroup`; service-to-service URLs wired
-via `fromService`/`fromDatabase`. **Triage still open:** the compose stack also runs
-`database_manager`, `copilot_executor`, `notification_server`, `platform_linking_manager`,
-and `falkordb` — the scheduler and copilot paths depend on the first two.
+Do this once up front and reuse the result in the wait loop. Also document on
+`workflows/cancel.request_cancel` that callers MUST authorize the `graph_exec_id` first
+(the primitive itself is unauthenticated by design).
 
-## Workstreams (one agent per area)
-
-Each workstream is a branch + PR. Ordering: **A → then B/C/D in parallel → then E → then
-F integration**. Dependencies are called out per stream.
+**Test.** Call `stop_graph_execution(user_id="other", graph_exec_id=<not owned>,
+wait_timeout=0)`; assert it raises `NotFoundError` and that `request_cancel` / the queue
+publish was **never** invoked.
 
 ---
 
-### Stream A — Data layer: Postgres + Key Value  `feat/render-data-layer`
+## 4. `render.yaml` — insecure Redis + non-Fernet encryption key
 
-Replace Supabase Postgres with Render Managed Postgres and Redis with Render Key Value.
-Source: `backend/schema.prisma`, `backend/migrations/`, `backend/data/db.py`,
-`backend/data/redis_client.py`, `backend/util/cache.py`, `backend/util/settings.py`.
+**Problem A — empty Redis password.** `REDIS_PASSWORD value: ""` on all four backend
+services (rest, ws, scheduler, database-manager). Render Key Value provisions an AUTH
+password even on the private network, so this either connects unauthenticated or fails
+AUTH.
 
-**Postgres**
-- **Version 16** (matches Supabase major; pgvector + pg_trgm available). Immutable after
-  create — confirm first.
-- Plan Standard/Pro (≥4 GB → ~100 conns). App is multi-process; total conns =
-  `DB_CONNECTION_LIMIT` (default 12) × processes × instances. No built-in pooler — size
-  the plan or lower the limit. HA needs Professional workspace + Pro plan.
-- Storage ~20 GB start (pgvector HNSW + trigram GIN indexes); autoscales, can't shrink.
-- Use the **internal** connection string; both `DATABASE_URL` and `DIRECT_URL` point at
-  it. Append `?schema=platform` via a wrapper var (`fromDatabase.connectionString` omits
-  it). App tables live in the non-public `platform` schema.
-- **Extensions** (created by migrations, not on by default): `vector` (pgvector),
-  `pg_trgm`. **`pg_cron` is NOT offered by Render** — move the store materialized-view
-  refresh to a Render Cron Job or the in-app scheduler (the migration only warns if
-  absent). **Verify** unqualified `::vector` casts / `<=>` resolve on Render, since the
-  extension is created by the app role rather than a Supabase system role (top
-  migration-time risk).
-- Migrations: `prisma migrate deploy` (using `DIRECT_URL`) as a predeploy on exactly one
-  backend service (see Stream E). Prisma client is generated at Docker build time.
-
-**Key Value (Redis) — RESOLVED: standalone client path behind a flag**
-- Root cause is the *client class*, not the pub/sub protocol: `RedisCluster` issues
-  `CLUSTER SLOTS`/`SHARDS` on connect, which single-node Render Key Value rejects.
-  Sharded pub/sub (`SSUBSCRIBE`/`SPUBLISH`) works on standalone Valkey 8, and standalone
-  is strictly more permissive than cluster for multi-key pipelines. Fix, gated by
-  `REDIS_CLUSTER_MODE` (default `true` to keep the existing prod cluster; Render sets
-  `false`):
-  1. `backend/data/redis_client.py` — `connect()`/`connect_async()` build plain
-     `Redis`/`AsyncRedis` when standalone; `resolve_shard_for_channel()` returns
-     `(HOST, PORT)` directly (skip `get_node_from_key`). The existing
-     `connect_sharded_pubsub[_async]()` already use a plain client → point at the single
-     node. `SPUBLISH`/`SSUBSCRIBE` via `execute_command` keep working.
-  2. `backend/util/cache.py` — `_get_redis()` builds plain `Redis` when standalone; drop
-     `target_nodes=RedisCluster.PRIMARIES` from the two `scan_iter` calls.
-  3. `backend/copilot/rate_limit.py` / `pending_messages.py` — only *catch*
-     `RedisClusterException` and use `execute_command("SPUBLISH", …)`; both function on
-     standalone. Verify, no change expected.
-  - Alternative (rejected): self-managed Valkey cluster as private services — heavier ops,
-    loses managed Key Value, contradicts arch.md.
-- Redis is used broadly: object cache, distributed locks, rate limiting, execution/WS
-  pub/sub, pending-message/turn queue → **`maxmemoryPolicy: noeviction`** (LRU would drop
-  locks/queued turns). Use a **paid** (disk-backed) instance. `ipAllowList: []`.
-- App needs discrete host/port: wire `REDIS_HOST`/`REDIS_PORT` via `fromService`
-  `host`/`port` (not just `connectionString`); inject `REDIS_PASSWORD` if auth is on.
-  Override `.env.default` port `17000` → `6379`.
-
-**Supabase→plain-Postgres gap (feeds Stream B):** no `auth` schema on Render. The signup
-triggers are `IF EXISTS`-guarded (won't fail; also largely moot since the auto-user
-trigger was dropped and users are created lazily). **No RLS policies exist** — authz is
-app-layer, so RLS is not a blocker.
-
-Deliverable: migrations run clean against fresh Render Postgres; standalone Redis client
-connects. **Blocks B, C, E, F.**
-
----
-
-### Stream B — Auth: run self-hosted GoTrue on Render  `feat/render-auth`
-
-**Corrected scope (see Findings #1): keep GoTrue, do not rewrite.** The backend only
-*verifies* JWTs (`autogpt_libs/auth/jwt_utils.py`, shared HMAC secret via
-`JWT_VERIFY_KEY`); it never issues/refreshes sessions. The `auth.users→platform.User`
-trigger was dropped (`20260311000000_drop_auto_user_trigger`); users are created lazily
-from JWT claims via `get_or_create_user`. No live FK from `platform.User` to `auth.users`.
-So the issuer is pluggable, and the repo already ships GoTrue (`supabase/gotrue:v2.170.0`
-in `db/docker/docker-compose.yml`).
-
-**Recommended approach (low-risk):**
-- GoTrue as a private web service (or behind the existing Kong gateway), backed by the
-  Stream-A Render Postgres (owns the `auth` schema in the same DB).
-- Backend keeps `JWT_VERIFY_KEY` = GoTrue's `GOTRUE_JWT_SECRET` (or move to ES256 —
-  `config.py` already supports it and warns against HS256).
-- Re-point `SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_URL` to the GoTrue/Kong URL; the
-  `@supabase/*` frontend libs keep working → **frontend is a URL re-point only**.
-- Replace `feature_flag.py`'s `auth.admin.get_user_by_id` (runtime GoTrue admin call)
-  with a direct admin call or a `platform.User` lookup.
-- Stand up **SMTP** (Render has no managed email) for verification/reset/email-change,
-  and register **Google OAuth** redirect URIs on the new domain.
-
-**JWT claim contract any issuer must reproduce:** `sub` (UUID), `email`, `role`
-(`authenticated`/`admin`), `phone`, optional `user_metadata.name`, `aud="authenticated"`,
-`exp`.
-
-**New env/secrets:** `JWT_VERIFY_KEY`/`GOTRUE_JWT_SECRET` (env-group `generateValue` or
-ES256 keypair), `SUPABASE_URL`/`NEXT_PUBLIC_SUPABASE_URL`/`SUPABASE_PUBLIC_URL`,
-`SUPABASE_SERVICE_ROLE_KEY`/`NEXT_PUBLIC_SUPABASE_ANON_KEY`, `GOTRUE_SMTP_*`,
-`GOTRUE_EXTERNAL_GOOGLE_*`, `GOTRUE_SITE_URL`, `GOTRUE_URI_ALLOW_LIST`,
-`GOTRUE_DB_DATABASE_URL` (dedicated `supabase_auth_admin` role).
-
-**Rejected alternative — native FastAPI auth:** new `users`/`sessions`/`refresh_tokens`
-tables, password hashing, JWT issuance+refresh, OAuth (authlib), email flows, and a full
-rewrite of `frontend/src/lib/supabase/*` + API token attach + `middleware.ts`. 3–5× the
-effort; only a later phase if dropping the Supabase footprint becomes a goal.
-
-**Phases:** spike/parity → env-ize URLs/secrets + SMTP/OAuth → sever `feature_flag.py`
-admin coupling → data migration (export `auth.users` + identities + refresh tokens,
-**preserving `id` UUIDs** — every FK across ~40 `User` relations depends on it) →
-RLS/trigger cleanup → cutover + forced re-login.
-
-**Risks:** UUID/data migration, password portability, admin-role preservation, email
-deliverability, OAuth redirect config, session invalidation at cutover. Deliverable: a
-user registers, logs in, and calls an authed endpoint end-to-end. **Depends on A.**
-
----
-
-### Stream C — RabbitMQ → Render Workflows  `feat/render-workflows-executor`
-
-Remove the broker; move executor dispatch to Render Workflows. Entry point
-`executor = "backend.exec:main"` → `run_processes(ExecutionManager())`.
-
-**Current:** RabbitMQ (`pika`/`aio_pika`, `backend/data/rabbitmq.py`). Topology in
-`backend/executor/utils.py`: `graph_execution` DIRECT queue (quorum,
-`x-consumer-timeout=86_400_000` = 24h) + `graph_execution_cancel` FANOUT. Producer
-`add_graph_execution` creates the `AgentGraphExecution` row, flips status to `QUEUED`
-(race guard), publishes `GraphExecutionEntry` JSON. `stop_graph_execution` broadcasts a
-`CancelExecutionEvent`. Consumer (`backend/executor/manager.py`) runs run+cancel threads
-with manual ack/nack; `ExecutionProcessor.on_graph_execution` is a **stateful,
-resume-capable in-process engine**. Cross-pod dedup via Redis `ClusterLock`; per-user
-throttle `max_concurrent_graph_executions_per_user` (default 25). Publish call sites:
-`api/features/v1.py`, `api/external/v1/routes.py`, `library/routes/presets.py`,
-`executions/review/routes.py`, `integrations/router.py`, `admin/diagnostics_admin_routes.py`,
-`executor/scheduler.py`, `copilot/tools/run_agent.py`, and **`blocks/agent.py`** (nested
-sub-graphs).
-
-**Mapping:** run queue → one `@app.task run_graph_execution`; each publish →
-`start_task("autogpt-executor/run_graph_execution", [entry_json])`. Engine reused ~verbatim
-(one instance == one run). nack+requeue → `@app.task(retry=Retry(...))` (resume makes
-retries safe). 24h timeout → `timeout_seconds` (max 86,400). FANOUT cancel →
-`cancel_task_run(run_id)` — **persist `graph_exec_id → run_id`** (new column/migration).
-Nested runs → subtasks. Scheduled runs → scheduler calls `start_task` (or a cron job).
-
-**Deployment caveat (Findings #3):** **not expressible in `render.yaml`.** Create the
-Workflow service manually (Dashboard → New → Workflow, Root `backend/workflows/`, Start
-`python main.py`). Add `render_sdk` to backend deps; producers need `RENDER_API_KEY`; wire
-the workflow slug as an env var (`fromService` can't reference a Workflow).
-
-**Honest mismatches:** 24h ceiling (parity, no headroom); **per-user rate limiting has no
-native equivalent** (reimplement via Redis counter or drop); **cancellation** must be a
-cooperative signal so the engine flips DB status to `TERMINATED` + cleans up reviews +
-cascades to children (else add a polled Redis cancel flag); **4 MB argument cap** may be
-exceeded by `GraphExecutionEntry` (pass `graph_exec_id` only + reload from DB);
-fine-grained ack/requeue lost (non-retryable → `return`, not `raise`); broker not fully
-removable until copilot-executor + notifications also migrate; Prometheus executor metrics
-regress to the Workflows Dashboard.
-
-**Phases:** spike SDK/task → extract the engine from `ExecutionManager` (pure refactor) →
-task behind `EXECUTION_BACKEND=rabbitmq|workflows` flag + app-side rate limit + persist
-`run_id` → convert nested/scheduled runs → cutover in staging (RabbitMQ rollback) →
-decommission. **Depends on A**; coordinates with B for auth context.
-
----
-
-### Stream D — ClamAV private service  `feat/render-clamav`
-
-Run ClamAV as a Docker private service reachable only from the backend. Client:
-`backend/util/virus_scanner.py` (`aioclamd`, INSTREAM over **TCP 3310**); call sites in
-`util/file.py`, `util/workspace.py`, store/oauth media routes. Current image:
-`clamav/clamav-debian:latest` (no custom Dockerfile).
-
-- **`type: pserv`**, `runtime: image` pulling `clamav/clamav-debian` — **pin an immutable
-  tag/digest** (`runtime: image` won't auto-redeploy a moving tag). Port 3310 (not
-  reserved); `clamd` binds `0.0.0.0` via `CLAMD_CONF_TCPAddr=0.0.0.0`.
-- **freshclam:** signatures go to `/var/lib/clamav`. **Attach a ~2 GB persistent disk**
-  there so definitions survive restarts (avoids re-downloading ~200–300 MB + mirror
-  rate-limits). Disk pins the service to a single instance (fine for a scanner).
-- **Memory (FLAG):** `clamd` loads the whole signature DB into RAM (~2–4 GB RSS, growing)
-  → **≥4 GB instance**; consider lowering `MaxThreads` from 12. Likely the priciest box.
-- Backend wiring (no code change): `CLAMAV_SERVICE_HOST` / `CLAMAV_SERVICE_PORT` via
-  `fromService`; keep `CLAMAV_SERVICE_ENABLED=true`,
-  `CLAMAV_MARK_FAILED_SCANS_AS_CLEAN=false` (fail-closed). Needs outbound HTTPS for
-  freshclam. **Independent — can start immediately.**
-
----
-
-### Stream E — Backend services: rest_server, websocket_server, scheduler_server  `feat/render-backend-services`
-
-Containerized backend services from `backend/Dockerfile`. **`dockerContext: .` (repo
-root)** — the Dockerfile `COPY`s repo-root-relative paths. One image reused by all three,
-differing by `dockerCommand`.
-
-**rest_server → public web service**
-- CMD `rest`. **App doesn't read `$PORT`** — `uvicorn` uses `agent_api_port` (env
-  `AGENT_API_PORT`, default 8006); the Dockerfile's `ENV PORT=8000` is never read. Fix:
-  `dockerCommand: /bin/sh -c 'exec env AGENT_API_PORT=$PORT rest'`.
-- Health `/health` (503 until DB connected). **Eager-connects Redis at startup** → a bad
-  Key Value config fails startup before `/health` responds (couples to Stream A blocker).
-- Plan `standard`+ (bundled chromium/ffmpeg). Migrations: `prisma migrate deploy` as this
-  service's `preDeployCommand` (or a Job from the `migrate` stage) — exactly one owner.
-- Env: Postgres (`DATABASE_URL`/`DIRECT_URL` + `DB_SCHEMA=platform`, `DB_CONNECTION_LIMIT`,
-  `PRISMA_SCHEMA=schema.prisma`), Redis (`REDIS_*`), Workflows (`start_task`, Stream C),
-  ClamAV (`CLAMAV_SERVICE_HOST`), auth/JWT (`JWT_VERIFY_KEY` **hard-fails if empty**,
-  `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), core secrets (`ENCRYPTION_KEY` — **must
-  stay stable or stored creds become undecryptable**, `UNSUBSCRIBE_SECRET_KEY`, VAPID
-  keys), URLs/CORS (`PLATFORM_BASE_URL`, `FRONTEND_BASE_URL`,
-  `BACKEND_CORS_ALLOW_ORIGINS`, `APP_ENV`), storage (`MEDIA_GCS_BUCKET_NAME` — local
-  fallback needs a disk that kills scaling), optional integration keys (`sync:false`).
-
-**websocket_server → public web service** (WSS)
-- CMD `ws`. Browser connects directly (`NEXT_PUBLIC_AGPT_WS_SERVER_URL`), so it must be
-  public. Binds `0.0.0.0:8001` — set `WEBSOCKET_SERVER_PORT=$PORT`. Health `/health`.
-- Env: `DATABASE_URL`/`DIRECT_URL`, `REDIS_*` (pub/sub delivery), `ENABLE_AUTH=true` + JWT
-  secrets (validates `?token=` JWT), `BACKEND_CORS_ALLOW_ORIGINS`. No Workflows dep. Can
-  scale out (fan-out via Redis).
-
-**scheduler_server → private service (`pserv`), NOT a cron job**
-- CMD `scheduler`. Runs APScheduler **and** an `AppService` RPC server that
-  rest/executor/copilot call via `get_scheduler_client()` → cron jobs can't receive
-  inbound, so `pserv`. Holds a persistent Postgres jobstore + dynamic user schedules.
-- **Port fix:** `PYRO_HOST=0.0.0.0`, expose 8003 (`EXECUTION_SCHEDULER_PORT=$PORT`).
-  Health `/health_check`. **`numInstances: 1`** (no leader election — two would
-  double-fire). Env: **`DIRECT_URL` required** (jobstore uses non-pooled), `DATABASE_URL`,
-  `REDIS_*`, `DATABASE_MANAGER_HOST` (RPC dep — see triage), Workflows creds (its
-  scheduled runs enqueue via `start_task`), `APP_ENV`. Allow a long health-check grace
-  (startup runs an embedding backfill).
-
-Deliverable: three services boot clean against the data layer + auth. **Depends on A, B, C.**
-
----
-
-### Stream F — Frontend + Blueprint integration + README  `feat/render-frontend-blueprint`
-
-Frontend web service, unify all fragments into one validated `render.yaml`, write the
-template README. **Runs last / integrates the others.**
-
-**Frontend (Web Service, NOT static)** — `next.config.mjs` sets `output: "standalone"`;
-there's a server-side proxy route, `middleware.ts`, server components/actions.
-- Root `autogpt_platform/frontend` (self-contained pnpm workspace). Runtime Node
-  (`NODE_VERSION=24`), pnpm `10.20.0` via corepack.
-- Build: `corepack enable && pnpm install --frozen-lockfile && pnpm generate:api && pnpm
-  build`. **Must run `generate:api`** (generated client is git-ignored); use the
-  committed `openapi.json`, **not** `generate:api:force`. Start `pnpm start`. Health
-  `/health`.
-- **Build memory ≥4 GB** — override `NODE_OPTIONS` to ~4096, set
-  `NEXT_PUBLIC_SOURCEMAPS=false`, leave `SENTRY_AUTH_TOKEN` unset; do **not** set `VERCEL`.
-- Backend discovery splits server-side (private URL via `AGPT_SERVER_URL`) vs client-side
-  (`NEXT_PUBLIC_*`). **`NEXT_PUBLIC_*` are inlined at build time** → must be the **public**
-  HTTPS/WSS URLs of rest/ws (resolvable at build). `NEXT_PUBLIC_AGPT_WS_SERVER_URL` must
-  be `wss://<host>/ws` — can't be composed purely from `fromService … host` (use a
-  `sync:false` value or the external URL).
-- Auth = **URL re-point only** if Stream B keeps GoTrue (else a `src/lib/supabase/*`
-  rewrite). Add the Render/public domain to `next.config.mjs` `images` + CORS `headers()`.
-
-**Blueprint assembly** — one `render.yaml` at repo root, one Project, all resources same
-region + workspace. References only: `fromDatabase`, `fromService`, `fromGroup`,
-`generateValue`. `previews: { generation: off }`, explicit `region`, no `domains:` block.
-Env group `autogpt-platform-secrets` (JWT secret via `generateValue`; note **`sync:false`
-is ignored inside groups** — Dashboard-prompted secrets go on the service or are entered
-on the group post-create). Backend web services bind Render's `PORT`. CORS scoped to the
-frontend origin (never `*.onrender.com`). **The executor Workflow is NOT in the blueprint**
-(Stream C) — reference its slug via env var. Rewrite `README.md` (H1, intro, Deploy
-button, architecture diagram, env-group table, "Using the app"); add `.env.example`;
-confirm `.env` gitignored. Run `render blueprints validate` until clean. **Depends on A–E.**
-
-Skeleton:
-
+**Solution A.** Wire the credential from the Key Value service instead of hardcoding an
+empty string. Prefer a single connection string:
 ```yaml
-previews:
-  generation: off
-projects:
-  - name: autogpt-platform
-    environments:
-      - name: production
-        databases:
-          - { name: db, plan: pro, postgresMajorVersion: "16", ipAllowList: [] }
-        services:
-          - { type: keyvalue, name: keyvalue, plan: standard, maxmemoryPolicy: noeviction, ipAllowList: [] }
-          - type: pserv
-            name: clamav
-            runtime: image
-            image: { url: clamav/clamav-debian:<pinned-tag> }
-          - type: web
-            name: rest-server
-            runtime: docker
-            plan: standard
-            rootDir: .
-            dockerContext: .
-            dockerfilePath: autogpt_platform/backend/Dockerfile
-            dockerCommand: /bin/sh -c 'exec env AGENT_API_PORT=$PORT rest'
-            healthCheckPath: /health
-            preDeployCommand: prisma migrate deploy
-            envVars:
-              - { key: DATABASE_URL, fromDatabase: { name: db, property: connectionString } }
-              - { key: DIRECT_URL, fromDatabase: { name: db, property: connectionString } }
-              - { key: REDIS_HOST, fromService: { name: keyvalue, type: keyvalue, property: host } }
-              - { key: REDIS_PORT, fromService: { name: keyvalue, type: keyvalue, property: port } }
-              - { key: CLAMAV_SERVICE_HOST, fromService: { name: clamav, type: pserv, property: host } }
-              - { fromGroup: autogpt-platform-secrets }
-          - type: web
-            name: websocket-server
-            runtime: docker
-            plan: standard
-            rootDir: .
-            dockerContext: .
-            dockerfilePath: autogpt_platform/backend/Dockerfile
-            dockerCommand: ws
-            envVars:
-              - { key: DATABASE_URL, fromDatabase: { name: db, property: connectionString } }
-              - { key: REDIS_HOST, fromService: { name: keyvalue, type: keyvalue, property: host } }
-              - { fromGroup: autogpt-platform-secrets }
-          - type: pserv
-            name: scheduler-server
-            runtime: docker
-            plan: standard
-            numInstances: 1
-            rootDir: .
-            dockerContext: .
-            dockerfilePath: autogpt_platform/backend/Dockerfile
-            dockerCommand: scheduler
-            envVars:
-              - { key: PYRO_HOST, value: "0.0.0.0" }
-              - { key: DATABASE_URL, fromDatabase: { name: db, property: connectionString } }
-              - { key: DIRECT_URL, fromDatabase: { name: db, property: connectionString } }
-              - { key: REDIS_HOST, fromService: { name: keyvalue, type: keyvalue, property: host } }
-              - { fromGroup: autogpt-platform-secrets }
-          - type: web
-            name: frontend
-            runtime: node
-            plan: standard
-            rootDir: autogpt_platform/frontend
-            buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm generate:api && pnpm build
-            startCommand: pnpm start
-            healthCheckPath: /health
-            envVars:
-              - { key: NEXT_PUBLIC_AGPT_SERVER_URL, sync: false }
-              - { key: NEXT_PUBLIC_AGPT_WS_SERVER_URL, sync: false }
-              - { key: AGPT_SERVER_URL, fromService: { name: rest-server, type: web, property: hostport } }
-          # gotrue (auth) — Stream B; executor Workflow — Stream C, Dashboard-only (not here)
-envVarGroups:
-  - name: autogpt-platform-secrets
-    envVars:
-      - { key: JWT_VERIFY_KEY, generateValue: true }
-      - { key: ENCRYPTION_KEY, value: "" }   # sync:false ignored in groups — set in Dashboard
+- key: REDIS_URL
+  fromService:
+    name: autogpt-platform-keyvalue
+    type: keyvalue
+    property: connectionString   # embeds host, port, and password
 ```
+If the app requires split host/port, additionally pull `property: password` rather than
+`value: ""`. Confirm the app reads whichever var you wire.
+
+**Problem B — `ENCRYPTION_KEY: generateValue: true`.** `ENCRYPTION_KEY` is a Fernet key:
+exactly 32 url-safe-base64 bytes (44 chars ending `=`). Render's `generateValue` emits a
+random alphanumeric string not guaranteed to be a valid Fernet key, so credential
+decryption can fail on first boot. The in-file comment already admits the value must be
+verified.
+
+**Solution B.** Make it deployer-supplied instead of auto-generated:
+```yaml
+- key: ENCRYPTION_KEY
+  sync: false   # deployer pastes output of `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+```
+Document the generation command in `README.md` deploy steps.
+
+**Test/verify.** Post-deploy smoke: a service that decrypts a stored credential starts
+without an `InvalidToken`/AUTH error. Add a note to the deploy runbook.
 
 ---
 
-## Cross-cutting blockers & decisions
+## 5. `util/feature_flag.py` — two silent behavior changes
 
-Resolve before/at build:
+**Problem A — `role` attribute dropped.** The LaunchDarkly context no longer sets
+`role` / `custom.role`. Any LD flag rule that targets on `role` now evaluates differently
+for every user, silently. (Admin *authorization* is unaffected — that is JWT-based — but
+flag *targeting* is.)
 
-1. **Redis cluster → standalone (A). ✅ RESOLVED** — standalone client path behind
-   `REDIS_CLUSTER_MODE` (3-file change; see Stream A). Remaining: confirm `noeviction`
-   given lock/queue keys' TTLs.
-2. **Auth strategy (B). ✅ DECIDED — GoTrue on Render.** Remaining: existing prod user
-   base to migrate, or fresh template deploy?
-3. **Workflows outside the Blueprint (C). ✅ ACCEPTED** — manual Dashboard creation +
-   env-var wiring of the slug; confirm preview-environment handling.
-4. **Port binding (E).** `AGENT_API_PORT`/`WEBSOCKET_SERVER_PORT`/`EXECUTION_SCHEDULER_PORT`
-   + `PYRO_HOST=0.0.0.0`.
-5. **Migrations ownership (A/E).** Exactly one service runs `prisma migrate deploy`.
-6. **Postgres major version 16** (immutable) — confirm vs Supabase.
-7. **pg_cron replacement (A)** — Render Cron Job or in-app scheduler.
-8. **DB connection budget (A/E)** — `DB_CONNECTION_LIMIT` × processes × instances < cap.
-9. **Extra compose services** — triage `database_manager`, `copilot_executor`,
-   `notification_server`, `platform_linking_manager`, `falkordb` (scheduler/copilot depend
-   on the first two).
-10. **Media storage (E)** — GCS vs local disk (disk kills scaling/zero-downtime).
-11. **ClamAV sizing (D)** — ~4 GB RAM + persistent disk; pin image tag.
-12. **SMTP + OAuth providers (B)** — required for GoTrue email flows + Google login.
-13. **`ENCRYPTION_KEY` stability (E)** — never regenerate per deploy.
-14. **WS public URL composition (E/F)** — `wss://<host>/ws` not buildable from
-    `fromService … host` alone.
+**Solution A.** Before shipping, audit LD flag rules for any `role` targeting. If none
+exist, add a code comment recording that `role` was intentionally dropped (GoTrue no
+longer supplies it) so the omission is not "fixed" back later. If targeting exists,
+re-populate `role` from the appropriate GoTrue/user lookup.
 
-## Orchestration mapping
+**Problem B — not-found users are no longer cached.** `get_user_by_id` now raises
+`ValueError` for a missing user; the caller falls to a degraded anonymous path that is
+deliberately **not** cached. A valid-UUID-but-deleted user id therefore re-hits the DB on
+every flag evaluation, unbounded.
 
-| Agent | Branch | Steps (checkpoints) | Depends on |
-|---|---|---|---|
-| A data-layer | `feat/render-data-layer` | plan, build, validate, open-pr | — |
-| B auth (GoTrue) | `feat/render-auth` | plan, build, test, open-pr | A |
-| C workflows | `feat/render-workflows-executor` | plan, build, test, open-pr | A |
-| D clamav | `feat/render-clamav` | build, open-pr | — |
-| E backend-svcs | `feat/render-backend-services` | build, open-pr | A,B,C |
-| F frontend+blueprint | `feat/render-frontend-blueprint` | build, validate, open-pr | A–E |
+**Solution B.** Distinguish "not found" (a stable, cacheable anonymous result) from
+"lookup failed" (transient — don't cache). Catch the not-found case explicitly and cache
+the anonymous context for it; only skip caching on genuine transient errors.
 
-Wave 1: **A + D** in parallel. Wave 2: **B + C** (after A). Wave 3: **E**. Wave 4: **F**.
+**Test.** (A) build a context for a user and assert whether `role` is present matches the
+intended decision. (B) evaluate a flag twice for a deleted-but-valid UUID and assert the
+user lookup runs at most once (mock/spy on `get_user_by_id`).
 
-## After all streams merge (orchestrator)
+---
 
-1. `/render-deploy` into shifra-workspace (`tea-d50tvuidbo4c73cahs30`).
-2. Create the executor **Workflow** manually in the Dashboard (Stream C) and wire its slug.
-3. `/render-template-quality-bar` full checklist.
-4. Read logs for **every** service; confirm each is `live` and clean.
-5. `/render-debug` loop on anything red → fix via PR → redeploy → re-read logs.
+## 6. Concurrency cap has different semantics per backend
+
+**Problem.** Same config knob, two meanings:
+- RabbitMQ (`executor/manager.py:376`): counts `RUNNING` executions **per (user_id,
+  graph_id)** at **consume** time.
+- Workflows (`workflows/rate_limit.acquire_run_slot`): a **per-user global** slot at
+  **dispatch** time.
+
+`max_concurrent_graph_executions_per_user` thus means different things depending on
+`EXECUTION_BACKEND`.
+
+**Conventional solution.** Pick one semantic and make both paths call a shared limiter so
+the cap is backend-independent. Decide explicitly whether the limit is per-user or
+per-(user, graph) and document it on the `Config` field in `util/settings.py`. Lowest-risk
+first step: align the semantics and add a docstring; unifying the implementation behind
+one helper is the fuller fix.
+
+---
+
+## 7. `render.yaml:454` — hardcoded internal port for `AGPT_SERVER_URL`
+
+**Problem.** `AGPT_SERVER_URL value: http://rest-server:10000/api` hardcodes `:10000`,
+while the sibling `GOTRUE_INTERNAL_URL` correctly derives host/port via
+`fromService … property: hostport`. If rest-server's `$PORT` ever differs, SSR silently
+breaks.
+
+**Conventional solution.** Derive it the same way as GoTrue:
+```yaml
+- key: AGPT_SERVER_URL
+  fromService:
+    name: rest-server
+    type: web
+    property: hostport      # -> "rest-server:10000"
+# then prefix scheme + /api suffix in app config, or use a small wrapper var
+```
+If the platform can't concatenate `/api` in-Blueprint, document that the port must track
+rest-server's `$PORT`.
+
+---
+
+## 8. `backend/Dockerfile:173` — `render_sdk` installed outside Poetry
+
+**Problem.** `RUN poetry run pip install --no-deps render_sdk==0.7.0` installs a runtime
+dependency outside the lockfile: unlocked (no hash pinning), invisible to `poetry.lock`,
+bypasses resolution. The comment justifies it (a ruff conflict via
+`openapi-python-client`) and pins the version, but a reviewer will object to un-locked
+prod deps in the image.
+
+**Conventional solution.** Move `render_sdk` into a dedicated Poetry dependency group
+with the conflicting transitive deps constrained/excluded, so it's captured in
+`poetry.lock`:
+```toml
+[tool.poetry.group.workflows.dependencies]
+render_sdk = "0.7.0"
+```
+If a hard resolver conflict truly blocks that, keep the `pip` install but track the pin in
+one documented place and add a hash. Behavior-preserving at runtime either way.
+
+---
+
+## 9. `executor/manager.py` — dead re-exports in `__all__`
+
+**Problem.** `__all__` re-exports 17 engine symbols "for backward compatibility," but ~6
+(`increment_execution_count`, `synchronized`, `update_graph_execution_state`,
+`update_node_execution_status`, `send_execution_update`,
+`async_update_graph_execution_state`) have no remaining importers — internal or external.
+Only 4 are imported via `backend.executor.manager` externally (`ExecutionProcessor`,
+`async_update_node_execution_status`, `get_db_async_client`,
+`send_async_execution_update`).
+
+**Conventional solution.** Migrate the ~4 external call sites (`orchestrator.py`,
+`blocks/helpers/review.py`, `admin/execution_analytics_routes.py`,
+`automod/manager.py`) to import directly from `backend.executor.engine`, then shrink
+`__all__` to only what's genuinely still re-exported. Low priority (compat shim).
+
+---
+
+## 10. Minor: untyped param + duplicated builder kwargs
+
+- **`executor/utils.py` `_dispatch_via_workflows(edb)`** — `edb` is untyped and is passed
+  either the `execution` module or a `DatabaseManagerAsyncClient` (structural duck-typing).
+  Annotate it (e.g. a `Protocol` exposing `set_render_run_id`, or the concrete client type
+  under `TYPE_CHECKING`) so the interface is explicit.
+- **`data/redis_client.py`** — `connect()` / `connect_async()` duplicate ~8 identical
+  kwargs across the standalone vs cluster branches; only `host/port` vs
+  `startup_nodes`+`address_remap` differ. Extract a shared `common` kwargs dict, keeping
+  the per-branch comments (esp. the async redis-py 6.x `retry` note) intact.
+- **`data/redis_client.py`** — env-bool parsing is inconsistent: `USE_ANNOUNCED_ADDRESS`
+  uses `in ("1","true","yes")` while `CLUSTER_MODE` uses `not in ("0","false","no")`.
+  Introduce one `_env_bool(name, default)` helper and use it for both.
+
+All behavior-preserving.
+
+---
+
+## 11. Remove root-level agent-coordination docs before publishing
+
+**Problem.** `plan.md` (this file), `remaining.md`, `workflow.md`, `arch.md`, `AGENT.md`
+at the repo root are internal handoff artifacts, not template documentation. For a
+**public, forkable deploy template** they should not ship. In particular **`workflow.md`
+documents the leaked-upstream-credential situation and the history-squash requirement** —
+exactly the content that must never appear in a public repo.
+
+**Conventional solution.** Delete these five files (or move them to an untracked
+`docs/internal/` that's gitignored) as part of the pre-publish cleanup. This aligns with
+the standing constraint: **squash the forked git history to a fresh no-ancestry history
+before any push/publish**, since upstream history carries real-format leaked credentials.
+Do the history squash and the file removal together in the final publish step.
+
+**Verify.** After cleanup, `git log` shows no upstream ancestry and the working tree
+contains only `render.yaml`, `README.md`, `.env.example`, and the application code.
