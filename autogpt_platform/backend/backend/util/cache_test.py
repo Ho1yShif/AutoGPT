@@ -12,10 +12,14 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from redis import Redis
+from redis.cluster import RedisCluster
 
+import backend.data.redis_client as redis_client
+import backend.util.cache as cache_module
 from backend.util.cache import cached, clear_thread_cache, thread_cached
 
 
@@ -1343,3 +1347,94 @@ class TestCacheNoneHandling:
         assert call_count == 1
 
         maybe_none_redis.cache_clear()
+
+
+class TestStandaloneSharedCacheRedis:
+    """Standalone (REDIS_CLUSTER_MODE=false) shared-cache behavior.
+
+    The shared-cache client must build a plain ``Redis`` and SCAN without the
+    cluster-only ``target_nodes`` fan-out, while the default cluster path keeps
+    fanning out across every primary.
+    """
+
+    def setup_method(self) -> None:
+        # _get_redis is @cache'd (singleton); drop it so each test rebuilds.
+        cache_module._get_redis.cache_clear()
+
+    def teardown_method(self) -> None:
+        cache_module._get_redis.cache_clear()
+
+    def test_get_redis_standalone_builds_plain_redis(self) -> None:
+        with (
+            patch.object(redis_client, "CLUSTER_MODE", False),
+            patch.object(cache_module, "Redis", autospec=True) as mock_redis,
+            patch.object(cache_module, "RedisCluster", autospec=True) as mock_cluster,
+        ):
+            mock_redis.return_value = MagicMock(spec=Redis)
+            cache_module._get_redis()
+
+        mock_redis.assert_called_once()
+        mock_cluster.assert_not_called()
+        kwargs = mock_redis.call_args.kwargs
+        assert kwargs["decode_responses"] is False  # binary mode for pickle
+        assert "startup_nodes" not in kwargs
+        assert "address_remap" not in kwargs
+
+    def test_get_redis_cluster_builds_cluster(self) -> None:
+        with (
+            patch.object(redis_client, "CLUSTER_MODE", True),
+            patch.object(cache_module, "RedisCluster", autospec=True) as mock_cluster,
+        ):
+            mock_cluster.return_value = MagicMock(spec=RedisCluster)
+            cache_module._get_redis()
+
+        mock_cluster.assert_called_once()
+        assert "startup_nodes" in mock_cluster.call_args.kwargs
+
+    def test_scan_cache_keys_standalone_drops_target_nodes(self) -> None:
+        fake = MagicMock()
+        fake.scan_iter.return_value = iter(["cache:foo:a", "cache:foo:b"])
+        with (
+            patch.object(redis_client, "CLUSTER_MODE", False),
+            patch.object(cache_module, "_get_redis", return_value=fake),
+        ):
+            keys = cache_module._scan_cache_keys("cache:foo:*")
+
+        assert keys == ["cache:foo:a", "cache:foo:b"]
+        # Standalone: a single SCAN covers the keyspace; no target_nodes.
+        fake.scan_iter.assert_called_once_with("cache:foo:*")
+
+    def test_scan_cache_keys_cluster_fans_out_to_primaries(self) -> None:
+        fake = MagicMock()
+        fake.scan_iter.return_value = iter(["cache:foo:a"])
+        with (
+            patch.object(redis_client, "CLUSTER_MODE", True),
+            patch.object(cache_module, "_get_redis", return_value=fake),
+        ):
+            keys = cache_module._scan_cache_keys("cache:foo:*")
+
+        assert keys == ["cache:foo:a"]
+        fake.scan_iter.assert_called_once_with(
+            "cache:foo:*", target_nodes=RedisCluster.PRIMARIES
+        )
+
+    def test_cache_clear_standalone_scans_and_deletes(self) -> None:
+        fake = MagicMock()
+        fake.scan_iter.return_value = iter(["cache:target_fn:h1", "cache:target_fn:h2"])
+        pipeline = MagicMock()
+        fake.pipeline.return_value = pipeline
+
+        @cached(ttl_seconds=60, shared_cache=True)
+        def target_fn(x: int) -> int:
+            return x
+
+        with (
+            patch.object(redis_client, "CLUSTER_MODE", False),
+            patch.object(cache_module, "_get_redis", return_value=fake),
+        ):
+            target_fn.cache_clear()
+
+        # Scanned without target_nodes, then pipelined a delete per matched key.
+        fake.scan_iter.assert_called_once_with("cache:target_fn:*")
+        assert pipeline.delete.call_count == 2
+        pipeline.execute.assert_called_once()

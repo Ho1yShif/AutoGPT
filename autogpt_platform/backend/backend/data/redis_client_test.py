@@ -6,6 +6,8 @@ Patches the redis-py constructors + ``ping()`` so no real Redis is needed.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from redis import Redis
+from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
 from redis.asyncio.retry import Retry as AsyncRetry
 from redis.cluster import RedisCluster
@@ -251,6 +253,137 @@ async def test_sharded_spublish_end_to_end_async() -> None:
         assert isinstance(res, int)
     finally:
         await redis_client.disconnect_async()
+
+
+# ---------- Standalone (non-cluster) mode: unit tests with mocks ----------
+#
+# REDIS_CLUSTER_MODE=false (e.g. Render Key Value) must build a plain
+# Redis/AsyncRedis client and skip cluster-only keyslot routing, while the
+# default cluster path stays fully intact (covered by the tests above).
+
+
+def test_connect_standalone_builds_plain_redis() -> None:
+    """In standalone mode ``connect()`` builds a plain ``Redis`` — no
+    ``startup_nodes`` / ``address_remap`` (both cluster-only)."""
+    with (
+        patch.object(redis_client, "CLUSTER_MODE", False),
+        patch.object(redis_client, "Redis", autospec=True) as mock_redis,
+    ):
+        mock_redis.return_value = MagicMock(spec=Redis)
+        client = redis_client.connect()
+
+    mock_redis.assert_called_once()
+    kwargs = mock_redis.call_args.kwargs
+    assert kwargs["host"] == redis_client.HOST
+    assert kwargs["port"] == redis_client.PORT
+    assert kwargs["password"] == redis_client.PASSWORD
+    assert kwargs["decode_responses"] is True
+    assert kwargs["health_check_interval"] == redis_client.HEALTH_CHECK_INTERVAL
+    # Cluster-only kwargs must be absent on the standalone client.
+    assert "startup_nodes" not in kwargs
+    assert "address_remap" not in kwargs
+    client.ping.assert_called_once()
+
+
+def test_connect_standalone_does_not_build_cluster() -> None:
+    """Standalone mode must not construct a ``RedisCluster`` at all."""
+    with (
+        patch.object(redis_client, "CLUSTER_MODE", False),
+        patch.object(redis_client, "Redis", autospec=True) as mock_redis,
+        patch.object(redis_client, "RedisCluster", autospec=True) as mock_cluster,
+    ):
+        mock_redis.return_value = MagicMock(spec=Redis)
+        redis_client.connect()
+
+    mock_cluster.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_connect_async_standalone_builds_plain_async_redis() -> None:
+    """Async standalone sibling: plain ``AsyncRedis``, no cluster kwargs."""
+    with (
+        patch.object(redis_client, "CLUSTER_MODE", False),
+        patch.object(redis_client, "AsyncRedis", autospec=True) as mock_redis,
+    ):
+        fake = MagicMock(spec=AsyncRedis)
+        fake.ping = AsyncMock()
+        mock_redis.return_value = fake
+        client = await redis_client.connect_async()
+
+    mock_redis.assert_called_once()
+    kwargs = mock_redis.call_args.kwargs
+    assert kwargs["host"] == redis_client.HOST
+    assert kwargs["port"] == redis_client.PORT
+    assert kwargs["password"] == redis_client.PASSWORD
+    assert kwargs["decode_responses"] is True
+    assert "startup_nodes" not in kwargs
+    assert "address_remap" not in kwargs
+    client.ping.assert_awaited_once()
+
+
+def test_resolve_shard_for_channel_standalone_returns_host_port_directly() -> None:
+    """Standalone mode has a single node owning every keyslot, so the resolver
+    returns ``(HOST, PORT)`` without calling ``get_node_from_key``."""
+    with (
+        patch.object(redis_client, "CLUSTER_MODE", False),
+        patch.object(redis_client, "get_redis") as mock_get_redis,
+    ):
+        host, port = redis_client.resolve_shard_for_channel("any-channel")
+
+    assert (host, port) == (redis_client.HOST, redis_client.PORT)
+    # Must not touch the cluster client / keyslot lookup in standalone mode.
+    mock_get_redis.assert_not_called()
+
+
+# ---------- Standalone mode: live pub/sub round-trip (gated) ----------
+#
+# Skipped unless a standalone Redis/Key Value is reachable on localhost:6379,
+# mirroring the cluster integration gating above so CI without a server
+# doesn't flap.
+
+
+def _has_live_standalone() -> bool:
+    with patch.object(redis_client, "CLUSTER_MODE", False):
+        try:
+            redis_client.get_redis.cache_clear()
+            c = redis_client.connect()
+        except Exception:  # noqa: BLE001 — any connect failure → skip
+            return False
+        try:
+            c.close()
+        except Exception:
+            pass
+    return True
+
+
+@pytest.mark.skipif(
+    not _has_live_standalone(),
+    reason="standalone redis not reachable on localhost:6379; skip round-trip",
+)
+def test_standalone_spublish_subscribe_round_trip() -> None:
+    """SPUBLISH → SSUBSCRIBE round-trip on a standalone server via the same
+    ``execute_command('SPUBLISH', ...)`` path the app uses (pending_messages)."""
+    with patch.object(redis_client, "CLUSTER_MODE", False):
+        redis_client.get_redis.cache_clear()
+        client = redis_client.connect()
+        channel = "stream-a:standalone:round-trip"
+        ps = client.pubsub()
+        try:
+            ps.ssubscribe(channel)
+            confirm = ps.get_message(timeout=2.0)
+            assert confirm is not None and confirm["type"] == "ssubscribe"
+            assert client.execute_command("SPUBLISH", channel, "hello") >= 1
+            received = ps.get_message(timeout=5.0)
+            assert received is not None and received["type"] == "smessage"
+            assert received["data"] == "hello"
+        finally:
+            try:
+                ps.sunsubscribe(channel)
+            except Exception:
+                pass
+            ps.close()
+            client.close()
+            redis_client.get_redis.cache_clear()
 
 
 # ---------- Sharded pub/sub: unit tests with mocks ----------

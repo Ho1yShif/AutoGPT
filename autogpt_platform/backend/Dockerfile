@@ -160,6 +160,16 @@ COPY docs /app/docs
 RUN POETRY_VIRTUALENVS_CREATE=true POETRY_VIRTUALENVS_IN_PROJECT=true \
     poetry install --no-ansi --only-root
 
+# Producer services (rest_server, scheduler_server) dispatch graph executions to
+# Render Workflows via backend/workflows/client.py, which imports render_sdk
+# lazily at first dispatch. render_sdk is intentionally NOT in pyproject.toml:
+# its transitive dep openapi-python-client pins ruff <0.14, conflicting with the
+# repo's ruff ^0.15. Install it --no-deps so the toolchain isn't downgraded (only
+# aiohttp/httpx are needed at runtime, already backend deps). Harmless/unused on
+# ws + database_manager, which share this one image. Matches the Render Workflow
+# service's own build command (Stream C, Dashboard).
+RUN poetry run pip install --no-deps render_sdk
+
 ENV PORT=8000
 
 CMD ["rest"]

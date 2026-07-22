@@ -29,6 +29,7 @@ from backend.data.dynamic_fields import merge_execution_input
 from backend.data.execution import (
     ExecutionContext,
     ExecutionStatus,
+    GraphExecutionEntry,
     GraphExecutionMeta,
     GraphExecutionStats,
     GraphExecutionWithNodes,
@@ -524,9 +525,9 @@ async def _validate_node_input_credentials(
             except ValidationError as e:
                 # Validation error means credentials were provided but invalid
                 # This should always be an error, even if optional
-                credential_errors[node.id][
-                    field_name
-                ] = f"{CRED_ERR_INVALID_PREFIX} {e}"
+                credential_errors[node.id][field_name] = (
+                    f"{CRED_ERR_INVALID_PREFIX} {e}"
+                )
                 continue
 
             try:
@@ -537,15 +538,15 @@ async def _validate_node_input_credentials(
             except Exception as e:
                 # Handle any errors fetching credentials
                 # If credentials were explicitly configured but unavailable, it's an error
-                credential_errors[node.id][
-                    field_name
-                ] = f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
+                credential_errors[node.id][field_name] = (
+                    f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
+                )
                 continue
 
             if not credentials:
-                credential_errors[node.id][
-                    field_name
-                ] = f"{CRED_ERR_UNKNOWN_PREFIX}{credentials_meta.id}"
+                credential_errors[node.id][field_name] = (
+                    f"{CRED_ERR_UNKNOWN_PREFIX}{credentials_meta.id}"
+                )
                 continue
 
             if (
@@ -655,18 +656,18 @@ async def _validate_node_input_credentials(
                             _mark_optional_skip()
                             continue
                         has_missing_credentials = True
-                        credential_errors[node.id][
-                            field_name
-                        ] = f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
+                        credential_errors[node.id][field_name] = (
+                            f"{CRED_ERR_NOT_AVAILABLE_PREFIX} {e}"
+                        )
                         continue
                     if not creds:
                         if field_is_optional:
                             _mark_optional_skip()
                             continue
                         has_missing_credentials = True
-                        credential_errors[node.id][
-                            field_name
-                        ] = f"{CRED_ERR_UNKNOWN_PREFIX}{cred_id}"
+                        credential_errors[node.id][field_name] = (
+                            f"{CRED_ERR_UNKNOWN_PREFIX}{cred_id}"
+                        )
 
         # If node has optional credentials and any are missing, skip the
         # node so the executor doesn't try to execute it with None creds.
@@ -1069,7 +1070,8 @@ async def stop_graph_execution(
         wait_timeout: Maximum time to wait for execution to stop (seconds)
         cascade: If True, recursively stop all child executions
     """
-    queue_client = await get_async_execution_queue()
+    use_workflows = config.execution_backend == "workflows"
+    queue_client = None if use_workflows else await get_async_execution_queue()
     db = execution_db if prisma.is_connected() else get_database_manager_async_client()
 
     # First, find and stop all child executions if cascading
@@ -1094,12 +1096,22 @@ async def stop_graph_execution(
                 return_exceptions=True,  # Don't fail parent stop if child stop fails
             )
 
-    # Now stop this execution
-    await queue_client.publish_message(
-        routing_key="",
-        message=CancelExecutionEvent(graph_exec_id=graph_exec_id).model_dump_json(),
-        exchange=GRAPH_EXECUTION_CANCEL_EXCHANGE,
-    )
+    # Now signal cancellation of this execution. Both paths are COOPERATIVE:
+    # the running engine flips DB status to TERMINATED, cancels reviews, and
+    # (via this function's recursion above) cascades to children.
+    if use_workflows:
+        # No FANOUT broadcast on the workflows path — set the polled Redis flag
+        # the running task watches (see backend.workflows.cancel).
+        from backend.workflows import cancel as wf_cancel
+
+        await wf_cancel.request_cancel(graph_exec_id)
+    else:
+        assert queue_client is not None  # non-None on the RabbitMQ path
+        await queue_client.publish_message(
+            routing_key="",
+            message=CancelExecutionEvent(graph_exec_id=graph_exec_id).model_dump_json(),
+            exchange=GRAPH_EXECUTION_CANCEL_EXCHANGE,
+        )
 
     if not wait_timeout:
         return
@@ -1162,10 +1174,57 @@ async def stop_graph_execution(
         if graph_exec.status == ExecutionStatus.RUNNING:
             await asyncio.sleep(0.1)
 
+    # Cooperative shutdown didn't complete within the window. On the workflows
+    # path, fall back to a best-effort HARD kill of the task run (skips the
+    # graceful DB cleanup, hence a backstop only).
+    if use_workflows:
+        from backend.workflows import client as wf_client
+
+        render_run_id = await db.get_render_run_id(graph_exec_id)
+        if render_run_id:
+            await wf_client.cancel_graph_execution_run(render_run_id)
+
     raise TimeoutError(
         f"Graph execution #{graph_exec_id} will need to take longer than {wait_timeout} seconds to stop. "
         f"You can check the status of the execution in the UI or try again later."
     )
+
+
+async def _dispatch_via_workflows(
+    graph_exec_entry: GraphExecutionEntry,
+    user_id: str,
+    edb,
+) -> None:
+    """Dispatch a graph execution to Render Workflows (EXECUTION_BACKEND=workflows).
+
+    Enforces the per-user concurrency cap app-side (no native equivalent),
+    stores the full entry in Redis (4 MB task-arg cap → pass ids only), starts
+    the Workflow task run, and persists its run id for later cancellation.
+    """
+    from backend.workflows import client as wf_client
+    from backend.workflows import entry_store as wf_entry_store
+    from backend.workflows import rate_limit as wf_rate_limit
+
+    graph_exec_id = graph_exec_entry.graph_exec_id
+
+    if not await wf_rate_limit.acquire_run_slot(user_id, graph_exec_id):
+        raise wf_rate_limit.ExecutionRateLimitError(
+            f"User {user_id} is at the concurrent-execution limit "
+            f"({config.max_concurrent_graph_executions_per_user}); "
+            "try again once a running execution finishes."
+        )
+    try:
+        await wf_entry_store.store_execution_entry(graph_exec_entry)
+        render_run_id = await wf_client.dispatch_graph_execution(graph_exec_id, user_id)
+        await edb.set_render_run_id(graph_exec_id, render_run_id)
+        logger.info(
+            f"Dispatched execution {graph_exec_id} to Render Workflows "
+            f"(run_id={render_run_id})"
+        )
+    except BaseException:
+        # Free the reserved slot so a failed dispatch doesn't leak capacity.
+        await wf_rate_limit.release_run_slot(user_id, graph_exec_id)
+        raise
 
 
 async def add_graph_execution(
@@ -1373,15 +1432,19 @@ async def add_graph_execution(
 
         graph_exec.status = ExecutionStatus.QUEUED
 
-        # Publish to execution queue for executor to pick up
-        # This happens AFTER status update to ensure only one request publishes
-        exec_queue = await get_async_execution_queue()
-        await exec_queue.publish_message(
-            routing_key=GRAPH_EXECUTION_ROUTING_KEY,
-            message=graph_exec_entry.model_dump_json(),
-            exchange=GRAPH_EXECUTION_EXCHANGE,
-        )
-        logger.info(f"Published execution {graph_exec.id} to RabbitMQ queue")
+        # Dispatch to the configured backend. This happens AFTER the status
+        # update to ensure only one request publishes/dispatches.
+        if config.execution_backend == "workflows":
+            await _dispatch_via_workflows(graph_exec_entry, user_id, edb)
+        else:
+            # Publish to RabbitMQ for the ExecutionManager to pick up.
+            exec_queue = await get_async_execution_queue()
+            await exec_queue.publish_message(
+                routing_key=GRAPH_EXECUTION_ROUTING_KEY,
+                message=graph_exec_entry.model_dump_json(),
+                exchange=GRAPH_EXECUTION_EXCHANGE,
+            )
+            logger.info(f"Published execution {graph_exec.id} to RabbitMQ queue")
     except BaseException as e:
         err = str(e) or type(e).__name__
         if not graph_exec:
