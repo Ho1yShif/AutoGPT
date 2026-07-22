@@ -12,11 +12,10 @@ import logging
 from functools import cache
 
 from backend.util.settings import Settings
+from backend.workflows.constants import TASK_NAME
 
 logger = logging.getLogger(__name__)
 settings = Settings()
-
-TASK_NAME = "run_graph_execution"
 
 
 def _task_slug() -> str:

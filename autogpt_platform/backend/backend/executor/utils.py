@@ -57,6 +57,10 @@ from backend.util.exceptions import (
 from backend.util.logging import TruncatedLogger, is_structured_logging_enabled
 from backend.util.settings import Config
 from backend.util.type import coerce_inputs_to_schema
+from backend.workflows import cancel as wf_cancel
+from backend.workflows import client as wf_client
+from backend.workflows import entry_store as wf_entry_store
+from backend.workflows import rate_limit as wf_rate_limit
 
 config = Config()
 logger = TruncatedLogger(logging.getLogger(__name__), prefix="[GraphExecutorUtil]")
@@ -1071,7 +1075,6 @@ async def stop_graph_execution(
         cascade: If True, recursively stop all child executions
     """
     use_workflows = config.execution_backend == "workflows"
-    queue_client = None if use_workflows else await get_async_execution_queue()
     db = execution_db if prisma.is_connected() else get_database_manager_async_client()
 
     # First, find and stop all child executions if cascading
@@ -1102,11 +1105,9 @@ async def stop_graph_execution(
     if use_workflows:
         # No FANOUT broadcast on the workflows path — set the polled Redis flag
         # the running task watches (see backend.workflows.cancel).
-        from backend.workflows import cancel as wf_cancel
-
         await wf_cancel.request_cancel(graph_exec_id)
     else:
-        assert queue_client is not None  # non-None on the RabbitMQ path
+        queue_client = await get_async_execution_queue()
         await queue_client.publish_message(
             routing_key="",
             message=CancelExecutionEvent(graph_exec_id=graph_exec_id).model_dump_json(),
@@ -1178,8 +1179,6 @@ async def stop_graph_execution(
     # path, fall back to a best-effort HARD kill of the task run (skips the
     # graceful DB cleanup, hence a backstop only).
     if use_workflows:
-        from backend.workflows import client as wf_client
-
         render_run_id = await db.get_render_run_id(graph_exec_id)
         if render_run_id:
             await wf_client.cancel_graph_execution_run(render_run_id)
@@ -1201,10 +1200,6 @@ async def _dispatch_via_workflows(
     stores the full entry in Redis (4 MB task-arg cap → pass ids only), starts
     the Workflow task run, and persists its run id for later cancellation.
     """
-    from backend.workflows import client as wf_client
-    from backend.workflows import entry_store as wf_entry_store
-    from backend.workflows import rate_limit as wf_rate_limit
-
     graph_exec_id = graph_exec_entry.graph_exec_id
 
     if not await wf_rate_limit.acquire_run_slot(user_id, graph_exec_id):

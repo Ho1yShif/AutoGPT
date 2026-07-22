@@ -19,7 +19,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from prometheus_client import Gauge
 from redis.asyncio.lock import Lock as AsyncRedisLock
@@ -131,9 +131,6 @@ def execute_graph(
     return processor.on_graph_execution(graph_exec_entry, cancel_event, cluster_lock)
 
 
-T = TypeVar("T")
-
-
 async def execute_node(
     node: Node,
     data: NodeExecutionEntry,
@@ -147,10 +144,12 @@ async def execute_node(
     persist the execution result, and return the subsequent node to be executed.
 
     Args:
-        db_client: The client to send execution updates to the server.
-        creds_manager: The manager to acquire and release credentials.
+        node: The graph node to execute.
         data: The execution data for executing the current node.
+        execution_processor: The processor owning the DB client and credentials manager.
         execution_stats: The execution statistics to be updated.
+        nodes_input_masks: Optional per-node input overrides.
+        nodes_to_skip: Optional set of node ids to skip.
 
     Returns:
         The subsequent node to be enqueued, or None if there is no subsequent node.
@@ -945,9 +944,8 @@ class ExecutionProcessor:
     ) -> ExecutionStatus:
         """
         Returns:
-            dict: The execution statistics of the graph execution.
-            ExecutionStatus: The final status of the graph execution.
-            Exception | None: The error that occurred during the execution, if any.
+            The final ``ExecutionStatus`` of the graph execution. (``execution_stats``
+            is mutated in place with the run's statistics.)
         """
         execution_status: ExecutionStatus = ExecutionStatus.RUNNING
         error: Exception | None = None

@@ -85,7 +85,7 @@ def _get_redis() -> RedisCluster | Redis:
     return client
 
 
-def _scan_cache_keys(match_pattern: str) -> list:
+def _scan_cache_keys(match_pattern: str) -> list[bytes]:
     """SCAN for keys matching ``match_pattern``, fanning out across every
     primary in cluster mode. In standalone mode a plain ``SCAN`` already
     walks the single keyspace, so ``target_nodes`` (cluster-only) is dropped.

@@ -7,6 +7,7 @@ into `backend.workflows.client` to start / cancel a Render Workflows task run;
 the task itself (`backend.workflows.tasks.run_graph_execution`) drives the same
 broker-agnostic engine in `backend.executor.engine`.
 
-`render_sdk` is imported lazily inside `client`/`tasks` so the default
-RabbitMQ path never requires the dependency.
+`render_sdk` is imported lazily inside `client` so the default RabbitMQ path
+never requires the dependency; `tasks`/`main` import it at module level since
+they only load in the Render Workflows deployment.
 """

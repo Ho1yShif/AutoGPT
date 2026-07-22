@@ -17,11 +17,14 @@ after the cooperative wait window; it kills the instance without the graceful
 DB cleanup, so it is never the primary mechanism.
 """
 
+import logging
 import threading
 import time
 
 from backend.data import redis_client as redis
 from backend.workflows.constants import RUN_ARTIFACT_TTL_SECONDS
+
+logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 2.0
 
@@ -63,9 +66,11 @@ def start_cancel_poller(
                 if is_cancel_requested_sync(graph_exec_id):
                     cancel_event.set()
                     return
-            except Exception:
+            except Exception as e:
                 # Never let a transient Redis hiccup kill the run; try again.
-                pass
+                # Leave a breadcrumb so a persistent failure (e.g. Redis down for
+                # the whole run, silently disabling cancellation) is observable.
+                logger.debug("cancel poll failed for %s: %s", graph_exec_id, e)
             time.sleep(_POLL_INTERVAL_SECONDS)
 
     thread = threading.Thread(target=_poll, daemon=True)

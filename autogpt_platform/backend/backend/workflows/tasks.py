@@ -23,10 +23,9 @@ from backend.data import redis_client as redis
 from backend.executor.cluster_lock import ClusterLock
 from backend.executor.engine import ExecutionProcessor
 from backend.util.settings import Settings
-from backend.workflows.constants import MAX_RUN_SECONDS
-
-from . import cancel as cancel_mod
-from . import entry_store, rate_limit
+from backend.workflows import cancel as cancel_mod
+from backend.workflows import entry_store, rate_limit
+from backend.workflows.constants import MAX_RUN_SECONDS, TASK_NAME
 
 logger = logging.getLogger(__name__)
 settings = Settings()
@@ -44,11 +43,11 @@ app = Workflows(
 
 
 @app.task(
-    name="run_graph_execution",
+    name=TASK_NAME,
     retry=_NO_RETRY,
     timeout_seconds=MAX_RUN_SECONDS,
 )
-def run_graph_execution(graph_exec_id: str, user_id: str) -> dict:
+def run_graph_execution(graph_exec_id: str, user_id: str) -> dict[str, str]:
     """Execute a single graph run dispatched via Render Workflows.
 
     Args are ids only (4 MB arg cap); the full `GraphExecutionEntry` is reloaded

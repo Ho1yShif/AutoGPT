@@ -1,4 +1,8 @@
-"""Shared timing constants for the Render Workflows execution path."""
+"""Shared constants for the Render Workflows execution path."""
+
+# Name of the graph-execution task, shared by the producer (dispatch slug) and
+# the task definition so the two can never drift out of sync.
+TASK_NAME = "run_graph_execution"
 
 # Render Workflows caps a single task run at 24h (86,400s). Used as the task
 # timeout and as the basis for the per-run Redis artifact TTL below.
