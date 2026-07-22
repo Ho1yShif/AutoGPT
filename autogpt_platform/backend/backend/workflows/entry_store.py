@@ -37,14 +37,6 @@ async def store_execution_entry(entry: GraphExecutionEntry) -> None:
     )
 
 
-async def load_execution_entry(graph_exec_id: str) -> GraphExecutionEntry | None:
-    r = await redis.get_redis_async()
-    blob = _decode(cast("str | bytes | None", await r.get(_key(graph_exec_id))))
-    if blob is None:
-        return None
-    return GraphExecutionEntry.model_validate_json(blob)
-
-
 def load_execution_entry_sync(graph_exec_id: str) -> GraphExecutionEntry | None:
     """Sync variant used by the (sync) Workflows task at run start."""
     r = redis.get_redis()
@@ -52,11 +44,6 @@ def load_execution_entry_sync(graph_exec_id: str) -> GraphExecutionEntry | None:
     if blob is None:
         return None
     return GraphExecutionEntry.model_validate_json(blob)
-
-
-async def delete_execution_entry(graph_exec_id: str) -> None:
-    r = await redis.get_redis_async()
-    await r.delete(_key(graph_exec_id))
 
 
 def delete_execution_entry_sync(graph_exec_id: str) -> None:

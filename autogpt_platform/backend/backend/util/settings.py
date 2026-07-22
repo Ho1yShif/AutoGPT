@@ -424,16 +424,6 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         description="The password for the Redis server (empty string if no password)",
     )
 
-    redis_cluster_mode: bool = Field(
-        default=True,
-        description=(
-            "Connect to Redis in cluster mode (default). Set to False for a "
-            "standalone Redis / managed single-node server (e.g. Render Key "
-            "Value), which uses a plain Redis client and skips cluster-only "
-            "keyslot routing."
-        ),
-    )
-
     postmark_sender_email: str = Field(
         default="invalid@invalid.com",
         description="The email address to use for sending emails",

@@ -58,7 +58,7 @@ def _get_redis() -> RedisCluster | Redis:
     from backend.data.redis_client import CLUSTER_MODE, _address_remap
 
     if not CLUSTER_MODE:
-        standalone: RedisCluster | Redis = Redis(
+        client: RedisCluster | Redis = Redis(
             host=settings.config.redis_host,
             port=settings.config.redis_port,
             password=settings.config.redis_password or None,
@@ -69,7 +69,7 @@ def _get_redis() -> RedisCluster | Redis:
             retry_on_timeout=True,
         )
     else:
-        standalone = RedisCluster(
+        client = RedisCluster(
             startup_nodes=[
                 ClusterNode(settings.config.redis_host, settings.config.redis_port)
             ],
@@ -81,8 +81,8 @@ def _get_redis() -> RedisCluster | Redis:
             retry_on_timeout=True,
             address_remap=_address_remap,
         )
-    standalone.ping()
-    return standalone
+    client.ping()
+    return client
 
 
 def _scan_cache_keys(match_pattern: str) -> list:

@@ -9,6 +9,7 @@ blocking the event loop.
 
 import asyncio
 import logging
+from functools import cache
 
 from backend.util.settings import Settings
 
@@ -29,8 +30,11 @@ def _task_slug() -> str:
     return f"{slug}/{TASK_NAME}"
 
 
+@cache
 def _get_client():
     # Lazy import: only the workflows deployment / producers need render_sdk.
+    # Memoized so the SDK client (and its connection pool) is reused across
+    # dispatches instead of rebuilt per graph execution.
     from render_sdk import Render
 
     return Render()
