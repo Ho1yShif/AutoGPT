@@ -174,6 +174,35 @@ and Key Value exist:
 5. Set `RENDER_WORKFLOW_SLUG` (+ `RENDER_API_KEY`, `EXECUTION_BACKEND=workflows`) on
    `rest-server` and `scheduler-server`, then redeploy those two.
 
+### Manual step — LLM / Claude API keys
+
+Two features need an LLM credential: **copilot chat** (`/api/chat/*`, on `rest-server`)
+and the **AI blocks** (AI Text Generator, `claude_code`, `orchestrator`, on the executor
+Workflow). **The deploy succeeds with no key set** — copilot chat and AI blocks simply
+return nothing until one is present, so this step is optional-but-required-for-those-features.
+
+Because `sync: false` is invalid inside env groups and the executor Workflow isn't a
+Blueprint resource, these keys are **not** in `render.yaml`. Instead use one
+Dashboard-managed env group read by both consumers, so each key is entered exactly once:
+
+1. **Create the env group.** Dashboard → Env Groups → New → name it
+   **`autogpt-platform-llm`**. (Dashboard-managed; do **not** add it to `render.yaml`.)
+2. **Add the keys for the transport you want** (pick one):
+
+   | Transport | Env to set | Render? |
+   |-----------|-----------|---------|
+   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`) | ✅ |
+   | Direct Anthropic | `ANTHROPIC_API_KEY=<key>` **and** `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅ |
+   | Subscription (`claude login`) | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true` | ⚠️ advanced/dev only (see Notes) |
+
+   Also add `OPENAI_API_KEY=<key>` if OpenAI-based blocks will be used (it also serves as
+   the OpenRouter fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
+3. **Link the group to both LLM consumers:** the **rest-server** web service (copilot chat)
+   and the **executor Workflow** (AI blocks). For each: service/Workflow → Environment →
+   Link Environment Group → `autogpt-platform-llm` → save & redeploy.
+4. Because both services share the group, **the same key value is read by rest-server and
+   the Workflow — you enter it exactly once.**
+
 ---
 
 ## Using the app
@@ -211,6 +240,12 @@ native and hot-reloading — see [`local.md`](local.md). Local dev uses the repo
 - **Scaling:** `scheduler-server` and `database-manager` stay at `numInstances: 1`.
   `clamav` has a disk, so it can't scale horizontally. Re-budget `DB_CONNECTION_LIMIT`
   before raising instance counts.
+- **Claude subscription transport (`CHAT_USE_CLAUDE_CODE_SUBSCRIPTION`):** advanced/dev
+  only. It needs `claude login` OAuth tokens persisted under the CLI config dir
+  (`$HOME/.claude` / `CLAUDE_CONFIG_DIR`), which an ephemeral container loses on redeploy.
+  Running it on Render would require a persistent disk on rest-server at the CLI config dir
+  (forcing single-instance, no zero-downtime deploys) plus a one-time `claude login` over
+  SSH. Prefer the OpenRouter or direct-Anthropic transports for deployments.
 
 For the AutoGPT product, docs, and community, see the
 [upstream repository](https://github.com/Significant-Gravitas/AutoGPT) and

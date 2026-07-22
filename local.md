@@ -91,6 +91,57 @@ use its entry point from `backend/`: `poetry run rest`, `poetry run ws`,
 
 ---
 
+## LLM / copilot keys
+
+Copilot chat and the AI blocks need an LLM credential. Locally, set the keys in
+`autogpt_platform/backend/.env` (`.env.default` already lists `ANTHROPIC_API_KEY=`
+and `OPENAI_API_KEY=`). Everything else runs without them — those features just
+return nothing until a key is present.
+
+```bash
+# autogpt_platform/backend/.env
+ANTHROPIC_API_KEY=sk-ant-...      # direct copilot + Claude AI blocks
+OPENAI_API_KEY=sk-...             # OpenAI blocks + OpenRouter fallback
+OPEN_ROUTER_API_KEY=sk-or-...     # default copilot transport (optional)
+# CHAT_USE_OPENROUTER=false       # route copilot direct to Anthropic instead
+```
+
+Copilot chat defaults to the OpenRouter transport (`CHAT_USE_OPENROUTER=true`); set
+it to `false` with `ANTHROPIC_API_KEY` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) to talk to
+`api.anthropic.com` directly. See the root [`README.md`](README.md) for the full
+transport table and the Render (deployed) wiring.
+
+---
+
+## Optional — run the Render Workflows execution path locally
+
+By default local dev executes graphs on **RabbitMQ** (simplest — nothing extra to
+install). If you want to exercise the same path a Render deploy uses (graph execution
+on Render Workflows), run the Workflows task server locally. You do **not** need a
+`RENDER_API_KEY` — the SDK routes to the local server.
+
+Prereqs: [Render CLI](https://render.com/docs/cli) 2.11.0+ (`brew install render`).
+
+```bash
+# In autogpt_platform/backend/.env — switch the backend to the Workflows path:
+EXECUTION_BACKEND=workflows
+RENDER_USE_LOCAL_DEV=true          # SDK targets the local task server (no API key)
+RENDER_WORKFLOW_SLUG=local         # any non-empty value works locally
+```
+
+```bash
+# Terminal 1 (from autogpt_platform/backend): start the local Workflows task server.
+render workflows dev -- poetry run python -m backend.workflows.main
+
+# Terminal 2: run the backend + frontend as usual (make run-backend / make run-frontend).
+```
+
+Local runs/results are held in memory and lost when the task server stops (see the
+[Workflows local-dev docs](https://render.com/docs/workflows-local-development)). To go
+back to the default, unset these vars (or set `EXECUTION_BACKEND=rabbitmq`).
+
+---
+
 ## Everyday commands
 
 ```bash
