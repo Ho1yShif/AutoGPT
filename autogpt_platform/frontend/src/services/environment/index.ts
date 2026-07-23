@@ -123,6 +123,13 @@ function isVercelPreview() {
   return process.env.VERCEL_ENV === "preview";
 }
 
+// Client-safe: NEXT_PUBLIC_VERCEL_ENV is set only on Vercel deploys (see
+// next.config.mjs). Off Vercel (Render, local Docker) it is undefined, so
+// Vercel-only integrations like Web Analytics / Speed Insights stay dormant.
+function isVercel() {
+  return Boolean(process.env.NEXT_PUBLIC_VERCEL_ENV);
+}
+
 function areFeatureFlagsEnabled() {
   return (
     process.env.NEXT_PUBLIC_LAUNCHDARKLY_ENABLED === "true" &&
@@ -161,6 +168,7 @@ export const environment = {
   isCloud,
   isLocal,
   isVercelPreview,
+  isVercel,
   isPostHogEnabled,
   areFeatureFlagsEnabled,
 };
