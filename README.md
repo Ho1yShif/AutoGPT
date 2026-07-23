@@ -65,11 +65,97 @@ declare Workflows yet); the backend reaches it via `RENDER_WORKFLOW_SLUG`.
 
 ---
 
+## Deploy
+
+These are the click-by-click steps. Each one links into
+**[Secrets & environment setup](#secrets--environment-setup)** below — the reference for what
+every value is, where it lives, and how to generate it. Keep that section open alongside these
+steps; the tables there are the source of truth.
+
+> **The two things to prepare first:** the [executor Workflow](#manual-step--the-executor-workflow)
+> (created by hand — the Blueprint needs its slug) and the
+> [`autogpt-platform-deploy-secrets` env group](#deployer-supplied-keys-bucket-3) (created before
+> you apply). Everything else is entered in the Blueprint prompts or after the first apply.
+
+1. Fork this repo and push it to your GitHub/GitLab account.
+2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
+   its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
+3. Create the `autogpt-platform-deploy-secrets` env group (Dashboard → Env Groups → New) with
+   `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
+   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
+4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
+   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs and the anon key.
+   (No SMTP needed — signups self-confirm by default.)
+5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
+   and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
+6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
+   redeploy the frontend and rest-server, then gotrue, ws, scheduler, and database-manager. See
+   [per-service prompts](#per-service-prompts-bucket-4).
+7. Finish the executor Workflow ([part B](#manual-step--the-executor-workflow)): now that
+   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env and deploy for real.
+8. Create the `autogpt-platform-llm` env group — see
+   [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
+
+Optional, after the app is up: [require email verification](#require-email-verification) (SMTP)
+and [enable Google login](#enable-google-login) — both off by default.
+
+### Manual step — the executor Workflow
+
+The executor is a Render Workflow, which Blueprints can't declare. The Blueprint needs its
+slug and it needs the Blueprint's Postgres / Key Value / `JWT_VERIFY_KEY`, so it's created in
+two parts around the apply.
+
+Part A — create the shell (before the apply, step 3):
+
+1. New → Workflow, link this repo, same workspace + region.
+2. Set Root Directory `autogpt_platform/backend`, Build Command
+   `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`, Start Command
+   `poetry run python -m backend.workflows.main`.
+3. Create it and copy its slug (task id shows as `{slug}/run_graph_execution`). Its first
+   deploy fails — Postgres/Redis/`JWT_VERIFY_KEY` don't exist yet. Expected; you only need the
+   slug for the Blueprint prompt (step 4).
+
+Part B — finish it (after the apply, step 7):
+
+4. Give it the same wiring as the backend: `DATABASE_URL` + `DIRECT_URL` with
+   `?schema=platform`, `REDIS_URL` (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
+   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY` (copy from rest-server),
+   the same `ENCRYPTION_KEY` as rest-server (confirm the boot fingerprint matches), plus any
+   provider API keys your graphs use.
+5. Deploy for real. It should boot; graph execution works end-to-end.
+
+### Manual step — LLM / Claude API keys
+
+Two features need an LLM credential: copilot chat (`/api/chat/*`, on rest-server) and the AI
+blocks (AI Text Generator, `claude_code`, `orchestrator`, on the executor Workflow). The
+deploy succeeds with no key set — these features just return nothing until one is present.
+
+Because `sync: false` is invalid in env groups and the Workflow isn't a Blueprint resource,
+these keys aren't in `render.yaml`. Use one Dashboard env group read by both consumers:
+
+1. Create the env group: Dashboard → Env Groups → New → `autogpt-platform-llm`. Don't add it
+   to `render.yaml`.
+2. Add the keys for one transport:
+
+   | Transport                         | Env to set                                                                                     | Render?                          |
+   | --------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------- |
+   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`)                         | ✅                               |
+   | Direct Anthropic                  | `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅                               |
+   | Subscription (`claude login`)     | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true`                                                       | ⚠️ advanced/dev only (see Notes) |
+
+   Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
+   fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
+
+3. Link the group to both consumers — rest-server (copilot chat) and the executor Workflow
+   (AI blocks): Environment → Link Environment Group → `autogpt-platform-llm` → save & redeploy.
+   Sharing the group means each key is entered once.
+
+---
+
 ## Secrets & environment setup
 
-Work through this section before deploying — it's what you actually configure, not just
-reference. Every environment value falls into one of five buckets, which tells you where it
-lives and when you set it:
+This is the reference behind the [Deploy](#deploy) steps above — what each value is, where it
+lives, and when you set it. Every environment value falls into one of five buckets:
 
 | #   | Bucket                                           | Where                   | Who sets it                | When                                 |
 | --- | ------------------------------------------------ | ----------------------- | -------------------------- | ------------------------------------ |
@@ -264,82 +350,6 @@ Workflow. It can't be `generateValue` (may emit chars Fernet rejects).
 Each service with the key logs `ENCRYPTION_KEY loaded (fingerprint=<12 hex chars>)` at boot —
 confirm rest-server, database-manager, and the Workflow print the same fingerprint; a mismatch
 means decryption fails. A malformed key fails fast at startup, not as a runtime `InvalidToken`.
-
----
-
-## Deploy
-
-Follow the buckets from [Secrets & environment setup](#secrets--environment-setup) in order:
-
-1. Fork this repo and push it to your GitHub/GitLab account.
-2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
-   its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
-3. Create the `autogpt-platform-deploy-secrets` env group (Dashboard → Env Groups → New) with
-   `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
-   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
-4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
-   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs and the anon key.
-   (No SMTP needed — signups self-confirm by default.)
-5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
-   and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
-6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
-   redeploy the frontend and rest-server, then gotrue, ws, scheduler, and database-manager. See
-   [per-service prompts](#per-service-prompts-bucket-4).
-7. Finish the executor Workflow ([part B](#manual-step--the-executor-workflow)): now that
-   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env and deploy for real.
-8. Create the `autogpt-platform-llm` env group — see
-   [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
-
-### Manual step — the executor Workflow
-
-The executor is a Render Workflow, which Blueprints can't declare. The Blueprint needs its
-slug and it needs the Blueprint's Postgres / Key Value / `JWT_VERIFY_KEY`, so it's created in
-two parts around the apply.
-
-Part A — create the shell (before the apply, step 3):
-
-1. New → Workflow, link this repo, same workspace + region.
-2. Set Root Directory `autogpt_platform/backend`, Build Command
-   `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`, Start Command
-   `poetry run python -m backend.workflows.main`.
-3. Create it and copy its slug (task id shows as `{slug}/run_graph_execution`). Its first
-   deploy fails — Postgres/Redis/`JWT_VERIFY_KEY` don't exist yet. Expected; you only need the
-   slug for the Blueprint prompt (step 4).
-
-Part B — finish it (after the apply, step 7):
-
-4. Give it the same wiring as the backend: `DATABASE_URL` + `DIRECT_URL` with
-   `?schema=platform`, `REDIS_URL` (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
-   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY` (copy from rest-server),
-   the same `ENCRYPTION_KEY` as rest-server (confirm the boot fingerprint matches), plus any
-   provider API keys your graphs use.
-5. Deploy for real. It should boot; graph execution works end-to-end.
-
-### Manual step — LLM / Claude API keys
-
-Two features need an LLM credential: copilot chat (`/api/chat/*`, on rest-server) and the AI
-blocks (AI Text Generator, `claude_code`, `orchestrator`, on the executor Workflow). The
-deploy succeeds with no key set — these features just return nothing until one is present.
-
-Because `sync: false` is invalid in env groups and the Workflow isn't a Blueprint resource,
-these keys aren't in `render.yaml`. Use one Dashboard env group read by both consumers:
-
-1. Create the env group: Dashboard → Env Groups → New → `autogpt-platform-llm`. Don't add it
-   to `render.yaml`.
-2. Add the keys for one transport:
-
-   | Transport                         | Env to set                                                                                     | Render?                          |
-   | --------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------- |
-   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`)                         | ✅                               |
-   | Direct Anthropic                  | `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅                               |
-   | Subscription (`claude login`)     | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true`                                                       | ⚠️ advanced/dev only (see Notes) |
-
-   Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
-   fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
-
-3. Link the group to both consumers — rest-server (copilot chat) and the executor Workflow
-   (AI blocks): Environment → Link Environment Group → `autogpt-platform-llm` → save & redeploy.
-   Sharing the group means each key is entered once.
 
 ---
 
