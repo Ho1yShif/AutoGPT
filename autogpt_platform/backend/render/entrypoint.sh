@@ -35,6 +35,13 @@ case "$role" in
     exec env DATABASE_API_PORT="$PORT" "$BIN/db"
     ;;
   migrate)
+    # GoTrue owns the `auth` schema but its image can't create it — its first
+    # migration runs `CREATE TABLE auth.users` and aborts with `schema "auth"
+    # does not exist` if the schema is absent (in the stock Supabase stack the
+    # Postgres init scripts create it; on Render nothing does). rest-server is
+    # the sole DB-DDL owner (inv #3), so create it here on the RAW url (no
+    # ?schema=platform wrapper) before Prisma runs.
+    echo 'CREATE SCHEMA IF NOT EXISTS auth;' | "$BIN/prisma" db execute --url "$RENDER_DIRECT_URL" --stdin
     exec "$BIN/prisma" migrate deploy
     ;;
   *)

@@ -258,10 +258,10 @@ projects:
               - key: FRONTEND_BASE_URL
                 value: https://REPLACE-WITH-FRONTEND-URL.onrender.com
               # Blueprint-generated secrets group (UNSUBSCRIBE_SECRET_KEY)
-              - fromGroup: autogpt-platform-secrets
+              - fromGroup: autogpt-platform-managed-secrets
               # Deployer-made group, created BEFORE apply: ENCRYPTION_KEY,
               # RENDER_API_KEY, RENDER_WORKFLOW_SLUG. See README.
-              - fromGroup: autogpt-platform-deploy-secrets
+              - fromGroup: autogpt-platform-byo-secrets
 
           # websocket-server — public web service (WSS). Redis pub/sub fan-out.
           - type: web
@@ -306,7 +306,7 @@ projects:
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
               # No ENCRYPTION_KEY: the WSS fan-out never decrypts creds (inv #5).
-              - fromGroup: autogpt-platform-secrets
+              - fromGroup: autogpt-platform-managed-secrets
 
           # scheduler-server — private. APScheduler + RPC. numInstances: 1 (no
           # leader election). Routes app DB access through database-manager;
@@ -358,10 +358,10 @@ projects:
                 value: prod
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              - fromGroup: autogpt-platform-secrets
+              - fromGroup: autogpt-platform-managed-secrets
               # Deployer-made group — needs RENDER_API_KEY + RENDER_WORKFLOW_SLUG
               # (also carries ENCRYPTION_KEY, unused here; combined-group tradeoff).
-              - fromGroup: autogpt-platform-deploy-secrets
+              - fromGroup: autogpt-platform-byo-secrets
 
           # database-manager — private. Centralized Prisma pool over RPC
           # (dockerCommand `db`). Required by scheduler-server (decision #4).
@@ -403,11 +403,11 @@ projects:
                 value: prod
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              - fromGroup: autogpt-platform-secrets
+              - fromGroup: autogpt-platform-managed-secrets
               # Deployer-made group — needs ENCRYPTION_KEY (database-manager
               # decrypts creds; same key as rest-server + the manual Workflow).
               # Also carries RENDER_API_KEY + RENDER_WORKFLOW_SLUG, unused here.
-              - fromGroup: autogpt-platform-deploy-secrets
+              - fromGroup: autogpt-platform-byo-secrets
 
           # frontend — Next.js public web service (Node). NEXT_PUBLIC_* are
           # inlined at BUILD time → must be PUBLIC URLs, set before first build.
@@ -456,8 +456,8 @@ projects:
 
 # ==========================================================================
 # Two groups are referenced via `fromGroup` above:
-#   autogpt-platform-secrets        — declared below; Blueprint-managed.
-#   autogpt-platform-deploy-secrets — deployer-made, NOT declared here. Holds
+#   autogpt-platform-managed-secrets        — declared below; Blueprint-managed.
+#   autogpt-platform-byo-secrets — deployer-made, NOT declared here. Holds
 #     ENCRYPTION_KEY / RENDER_API_KEY / RENDER_WORKFLOW_SLUG plus the LLM keys
 #     (OPEN_ROUTER_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / CHAT_*);
 #     created by hand before apply so services boot with values present
@@ -468,7 +468,7 @@ projects:
 # JWT_VERIFY_KEY stays a rest-server generateValue (fanned out), not in a group.
 # ==========================================================================
 envVarGroups:
-  - name: autogpt-platform-secrets
+  - name: autogpt-platform-managed-secrets
     envVars:
       - key: UNSUBSCRIBE_SECRET_KEY   # signs email unsubscribe links
         generateValue: true
