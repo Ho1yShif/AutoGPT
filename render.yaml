@@ -194,19 +194,19 @@ projects:
             #   BACKEND_CORS_ALLOW_ORIGINS <- [FRONTEND_BASE_URL]
             # ${VAR:-...} lets a Dashboard override win (custom domains).
             dockerCommand: >-
-              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
               export PLATFORM_BASE_URL="${PLATFORM_BASE_URL:-$RENDER_EXTERNAL_URL}";
               export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
-              exec env AGENT_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/rest'
+              exec env AGENT_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/rest
             healthCheckPath: /health
             # Prisma resolves both url=DATABASE_URL and directUrl=DIRECT_URL at
             # schema load, so both must be exported here too (else first deploy
             # fails with "Environment variable not found: DATABASE_URL").
             preDeployCommand: >-
-              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              /app/autogpt_platform/backend/.venv/bin/prisma migrate deploy'
+              /app/autogpt_platform/backend/.venv/bin/prisma migrate deploy
             envVars:
               # Postgres
               - key: RENDER_DATABASE_URL
@@ -293,10 +293,10 @@ projects:
             dockerfilePath: autogpt_platform/backend/Dockerfile
             # Derive CORS from FRONTEND_BASE_URL (pulled from rest-server below).
             dockerCommand: >-
-              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
               export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
-              exec env WEBSOCKET_SERVER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/ws'
+              exec env WEBSOCKET_SERVER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/ws
             healthCheckPath: /health
             envVars:
               - key: RENDER_DATABASE_URL
@@ -344,9 +344,9 @@ projects:
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
             dockerCommand: >-
-              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              exec env EXECUTION_SCHEDULER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/scheduler'
+              exec env EXECUTION_SCHEDULER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/scheduler
             # NOTE: pserv can't declare healthCheckPath in a Blueprint. Serves
             # /health_check on its RPC port; set it in the Dashboard if desired.
             envVars:
@@ -401,9 +401,9 @@ projects:
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
             dockerCommand: >-
-              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              exec env DATABASE_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/db'
+              exec env DATABASE_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/db
             # NOTE: pserv can't declare healthCheckPath in a Blueprint.
             envVars:
               - key: PYRO_HOST
