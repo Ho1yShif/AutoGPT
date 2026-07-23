@@ -27,6 +27,37 @@ Run every command from the `autogpt_platform/` directory unless a step says othe
 
 ---
 
+## Environment files
+
+`make init-env` creates **three** `.env` files from their `.env.default` templates — one
+per part of the stack. They are **not interchangeable**: each is loaded by a different set
+of services, so a key placed in the wrong file is silently ignored by the service that
+needs it (this is the usual cause of "I set my key but the feature still says no key").
+
+| File | Loaded by | Put here |
+|------|-----------|----------|
+| `backend/.env` | **every backend service** — `rest_server`, `executor`, `copilot_executor`, `scheduler_server`, `database_manager`, `websocket_server` (they share one `env_file`) | LLM/provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPEN_ROUTER_API_KEY`), `CHAT_*`, `EXECUTION_BACKEND`, DB/Redis/RabbitMQ overrides |
+| `frontend/.env` | the `frontend` container only | `NEXT_PUBLIC_*` browser vars — **never secrets**, these are inlined into the client bundle |
+| `.env` (root) | Docker Compose's own `${VAR}` interpolation + the Supabase stack (GoTrue / db / kong) | Supabase/auth infra values — **not** app or LLM keys |
+
+A key needed by services in more than one group must be added to **each** file that serves
+those services — they are separate files, not one shared file. (For example, a provider key
+used by both a backend block and a frontend feature goes in `backend/.env` *and*
+`frontend/.env`.) Most LLM/copilot keys are backend-only and belong in `backend/.env`.
+
+> **After editing any `.env`, recreate the affected containers** — `env_file` is read when a
+> container is *created*, not on restart, so a plain `docker compose restart` keeps the old
+> values:
+>
+> ```bash
+> docker compose up -d --force-recreate \
+>   rest_server copilot_executor scheduler_server executor database_manager websocket_server
+> ```
+>
+> In core-in-Docker mode (option B) the app runs natively — just restart `make run-backend`.
+
+---
+
 ## A. Full Docker stack
 
 ```bash
@@ -93,23 +124,38 @@ use its entry point from `backend/`: `poetry run rest`, `poetry run ws`,
 
 ## LLM / copilot keys
 
-Copilot chat and the AI blocks need an LLM credential. Locally, set the keys in
-`autogpt_platform/backend/.env` (`.env.default` already lists `ANTHROPIC_API_KEY=`
-and `OPENAI_API_KEY=`). Everything else runs without them — those features just
-return nothing until a key is present.
+Copilot chat and the AI blocks need an LLM credential. Locally these keys go in
+`autogpt_platform/backend/.env` — **not** the root `.env`; the copilot service
+(`copilot_executor`) and the executor only load `backend/.env` (see
+[Environment files](#environment-files) above). `.env.default` already lists
+`ANTHROPIC_API_KEY=` and `OPENAI_API_KEY=`. Everything else runs without them — those
+features just return nothing until a key is present. **Recreate the backend containers
+after editing** (`docker compose up -d --force-recreate copilot_executor rest_server executor`)
+so the new values are picked up.
+
+Copilot chat defaults to the **OpenRouter** transport (`CHAT_USE_OPENROUTER=true`). Pick
+one of these recipes in `autogpt_platform/backend/.env`:
 
 ```bash
 # autogpt_platform/backend/.env
-ANTHROPIC_API_KEY=sk-ant-...      # direct copilot + Claude AI blocks
-OPENAI_API_KEY=sk-...             # OpenAI blocks + OpenRouter fallback
-OPEN_ROUTER_API_KEY=sk-or-...     # default copilot transport (optional)
-# CHAT_USE_OPENROUTER=false       # route copilot direct to Anthropic instead
+
+# --- Option A: OpenRouter (default transport, one key) ---
+OPEN_ROUTER_API_KEY=sk-or-...     # copilot chat + OpenRouter-routed blocks
+
+# --- Option B: direct Anthropic (no OpenRouter) ---
+# Copilot uses the Claude Agent SDK path, which requires CHAT_API_KEY to be
+# set as well — ANTHROPIC_API_KEY alone raises "No API key configured".
+ANTHROPIC_API_KEY=sk-ant-...      # SDK subprocess + Claude AI blocks
+CHAT_API_KEY=sk-ant-...           # same value — clears the copilot key check
+CHAT_USE_OPENROUTER=false         # route copilot straight to api.anthropic.com
+
+# --- Independent of the copilot transport above ---
+OPENAI_API_KEY=sk-...             # OpenAI-based blocks
 ```
 
-Copilot chat defaults to the OpenRouter transport (`CHAT_USE_OPENROUTER=true`); set
-it to `false` with `ANTHROPIC_API_KEY` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) to talk to
-`api.anthropic.com` directly. See the root [`README.md`](README.md) for the full
-transport table and the Render (deployed) wiring.
+Under Option B, leaving `CHAT_USE_OPENROUTER` at its default `true` would send your
+Anthropic key to OpenRouter and 401 — you must set it to `false`. See the root
+[`README.md`](README.md) for the full transport table and the Render (deployed) wiring.
 
 ---
 

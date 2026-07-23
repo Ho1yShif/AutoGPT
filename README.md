@@ -103,7 +103,12 @@ entered in the Dashboard at deploy time.
 | `GOTRUE_SMTP_*` | gotrue | SMTP host/port/user/pass/sender/admin (email confirm, reset, change) |
 | `GOTRUE_EXTERNAL_GOOGLE_*` | gotrue | Optional Google OAuth (leave `ENABLED=false` to skip) |
 
-See [`.env.example`](.env.example) for the full list with example values.
+The authoritative list of deployer-supplied values is [`render.yaml`](render.yaml) itself —
+every one is a `sync: false` entry annotated with a `# DEPLOYER:` comment, and Render prompts
+for them when you deploy the Blueprint. The table above is the human-readable summary.
+
+> **Local development** does not use this table — it runs from the committed `.env.default`
+> files via `make init-env`. See [`local.md`](local.md#environment-files).
 
 #### Generating the anon key
 
@@ -223,6 +228,12 @@ To run the stack on your own machine — full Docker or core-in-Docker with the 
 native and hot-reloading — see [`local.md`](local.md). Local dev uses the repo's
 `docker-compose.yml` and the **RabbitMQ** execution backend, **not** Render Workflows
 (`EXECUTION_BACKEND=workflows` is a deploy-only concern handled by `render.yaml`).
+
+Unlike the single Dashboard env groups used for the Render deploy above, local dev reads
+**three separate `.env` files** — `backend/.env` (all backend services, incl. LLM/copilot
+keys), `frontend/.env` (browser `NEXT_PUBLIC_*` only), and the root `.env` (Compose +
+Supabase infra). Put each key in the file whose services need it, and recreate the affected
+containers after editing. See [Environment files](local.md#environment-files) in `local.md`.
 
 ---
 
