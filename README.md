@@ -8,8 +8,6 @@ executor. No managed RabbitMQ, no managed Supabase, no hardcoded hosts.
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Significant-Gravitas/AutoGPT)
 
-> Replace the `repo=` URL above with your fork before publishing.
-
 ---
 
 ## Architecture
