@@ -24,7 +24,7 @@ from backend.executor.activity_status_generator import (
     DEFAULT_USER_PROMPT,
     generate_activity_status_for_execution,
 )
-from backend.executor.manager import get_db_async_client
+from backend.executor.engine import get_db_async_client
 from backend.util.settings import Settings
 
 logger = logging.getLogger(__name__)

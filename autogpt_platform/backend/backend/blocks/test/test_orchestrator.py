@@ -896,7 +896,7 @@ async def test_orchestrator_agent_mode():
         "backend.blocks.orchestrator.get_database_manager_async_client",
         return_value=mock_db_client,
     ), patch(
-        "backend.executor.manager.async_update_node_execution_status",
+        "backend.executor.engine.async_update_node_execution_status",
         new_callable=AsyncMock,
     ), patch(
         "backend.integrations.creds_manager.IntegrationCredentialsManager"

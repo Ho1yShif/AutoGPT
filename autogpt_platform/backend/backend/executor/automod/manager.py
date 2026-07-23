@@ -215,7 +215,7 @@ class AutoModManager:
     ):
         """Update node execution statuses for frontend display when moderation fails"""
         # Import here to avoid circular imports
-        from backend.executor.manager import send_async_execution_update
+        from backend.executor.engine import send_async_execution_update
 
         if moderation_type == "input":
             # For input moderation, mark queued/running/incomplete nodes as failed
