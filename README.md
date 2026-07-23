@@ -1,229 +1,265 @@
-<p align="center">
-  <a href="https://platform.agpt.co/signup?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=hero_banner">
-    <img src="docs/home/.gitbook/assets/Banner_image.png" alt="AutoGPT" width="100%" />
-  </a>
-</p>
+# Deploy AutoGPT Platform on Render
 
-<h1 align="center">AutoGPT — AI agents that finish the work</h1>
+Run the full [AutoGPT Platform](https://github.com/Significant-Gravitas/AutoGPT) — the
+visual agent builder, marketplace, and execution engine — on [Render](https://render.com)
+from a single `render.yaml` Blueprint. Managed Postgres and Key Value replace Supabase and
+Redis, self-hosted GoTrue handles auth, ClamAV scans uploads, and Render Workflows run the
+executor. No managed RabbitMQ, no managed Supabase, no hardcoded hosts.
 
-<p align="center">
-  <strong>Get 10 hours back every week.</strong><br />
-  Describe what you want done. AutoGPT builds the agent, runs it, and reports back.
-</p>
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Significant-Gravitas/AutoGPT)
 
-<p align="center">
-  <a href="https://platform.agpt.co/signup?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=header_get_started"><strong>Get started</strong></a>
-  ·
-  <a href="https://platform.agpt.co/tour?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=tour_header">Tour</a>
-  ·
-  <a href="https://agpt.co/pricing?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=header_pricing">Pricing</a>
-  ·
-  <a href="https://docs.agpt.co">Docs</a>
-  ·
-  <a href="https://discord.gg/autogpt">Discord</a>
-  ·
-  <a href="#self-host-autogpt">Self-host</a>
-</p>
-
-<p align="center">
-  <a href="https://discord.gg/autogpt">
-    <img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Join Discord" />
-  </a>
-  <a href="https://docs.agpt.co">
-    <img src="https://img.shields.io/badge/Docs-read-0A7AFF?logo=gitbook&logoColor=white" alt="Read the docs" />
-  </a>
-</p>
+> Replace the `repo=` URL above with your fork before publishing.
 
 ---
 
-## The open-source platform for AI agents
+## Architecture
 
-AutoGPT lets you build, deploy, and run AI agents that carry out complete workflows. Describe an outcome in plain English or shape every step in the visual builder, then run the agent on demand, on a schedule, or from a trigger.
+Everything below is declared in [`render.yaml`](render.yaml) under one Render **Project**
+(`autogpt-platform`), same region (`oregon`) and workspace — required for private
+networking. The executor **Workflow** is the one piece created by hand (Blueprints can't
+declare Workflows yet); the backend reaches it via `RENDER_WORKFLOW_SLUG`.
 
-**185,000+ GitHub stars. Cited by:**
+```
+                       ┌──────────────────────────┐
+   browser  ─────────▶ │  frontend (Next.js, web) │  public HTTPS
+                       │  /auth/v1/* ─┐           │
+                       └──────┬───────┼───────────┘
+        NEXT_PUBLIC_* (HTTPS) │       │ private proxy
+              ┌───────────────┘       ▼
+              ▼                 ┌─────────────────────┐
+   ┌──────────────────┐  WSS    │ gotrue (auth, pserv)│───┐
+   │ websocket-server │◀──────▶ └─────────────────────┘   │
+   │   (docker, web)  │                                   │ SQL
+   └────────┬─────────┘         ┌───────────────────────┐ │
+            │            ┌────▶ │ rest-server (docker,  │ │
+            │            │      │ web) — owns migrations│─┤
+            │            │      └──┬─────────┬────────┬─┘ │
+            │ pub/sub    │  RPC    │ SQL     │ cache  │ start_task()
+            ▼            │         ▼         ▼        ▼    ▼
+   ┌──────────────┐  ┌───┴──────┐ ┌──────────┐ ┌──────────┐ ┌────────────────────┐
+   │  keyvalue    │  │scheduler-│ │   db     │ │ keyvalue │ │  Render Workflows  │
+   │  (redis)     │  │ server   │ │(postgres)│ │ (redis)  │ │  executor          │
+   └──────────────┘  │ (pserv)  │ └────┬─────┘ └──────────┘ │ (Dashboard-only,   │
+                     └────┬─────┘      │                    │  NOT in blueprint) │
+                          │ RPC        │ SQL                └────────────────────┘
+                          ▼            │
+                 ┌──────────────────┐  │        ┌───────────────────────────┐
+                 │ database-manager │──┘        │ clamav (image, pserv)     │
+                 │     (pserv)      │           │ file scanning, 3310/TCP   │◀── rest-server
+                 └──────────────────┘           └───────────────────────────┘
 
-| | |
-|---|---|
-| “Next frontier of prompt engineering imo: ‘AutoGPTs’.” | **Andrej Karpathy**, founding member of OpenAI |
-| “If you have a phone you can run AutoGPT. You don't even need to learn how to code.” | **Amjad Masad**, co-founder & CEO of Replit |
-| “AutoGPT might be the next big step in AI.” | **Lior Alexander**, CEO of AlphaSignal |
+   cron: autogpt-platform-mv-refresh — refreshes store materialized views (pg_cron replacement)
+```
+
+| Resource | Type | Role |
+|----------|------|------|
+| `autogpt-platform-db` | Postgres 18 | App data (`platform` schema) + GoTrue's `auth` schema |
+| `autogpt-platform-keyvalue` | Key Value | Locks, queues, pending-turn buffers, rate limits, cache (`noeviction`) |
+| `autogpt-platform-mv-refresh` | Cron | Refreshes store/suggested-block materialized views every 15 min |
+| `clamav` | Private (image) | Virus scanning for uploads (raw TCP 3310) |
+| `autogpt-platform-gotrue` | Private (image) | Self-hosted Supabase Auth; reached only via the frontend `/auth/v1` proxy |
+| `rest-server` | Web (Docker) | FastAPI API; **sole owner of `prisma migrate deploy`** |
+| `websocket-server` | Web (Docker) | WSS event fan-out via Redis pub/sub |
+| `scheduler-server` | Private (Docker) | APScheduler + RPC (`numInstances: 1`) |
+| `database-manager` | Private (Docker) | Centralized Prisma pool over RPC (scheduler's DB backend) |
+| `frontend` | Web (Node) | Next.js UI |
+| **executor Workflow** | **Workflow (manual)** | Runs agent graph executions; created in the Dashboard |
 
 ---
 
-## Four surfaces, one platform
+## Secrets & environment
 
-<table>
-  <tr>
-    <td width="50%" align="center" valign="top">
-      <a href="https://agpt.co/product/autopilot/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=autopilot">
-        <img src="docs/content/imgs/readme/autogpt_autopilot_chat.jpg" alt="AutoPilot chat creating an AutoGPT agent" />
-      </a>
-      <br /><strong><a href="https://agpt.co/product/autopilot/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=autopilot">AutoPilot</a></strong>
-      <br />Describe the job in plain English and turn the conversation into a working agent.
-    </td>
-    <td width="50%" align="center" valign="top">
-      <a href="https://agpt.co/product/agents/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=agents">
-        <img src="docs/content/imgs/readme/autogpt_agent_dashboard.jpg" alt="Agents dashboard showing statuses, runs, and costs" />
-      </a>
-      <br /><strong><a href="https://agpt.co/product/agents/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=agents">Agents</a></strong>
-      <br />See every agent, run, cost, and action that needs your attention.
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" align="center" valign="top">
-      <a href="https://agpt.co/product/marketplace/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=marketplace">
-        <img src="docs/content/imgs/readme/autogpt_marketplace.png" alt="AutoGPT Marketplace showing ready-made community agents" />
-      </a>
-      <br /><strong><a href="https://agpt.co/product/marketplace/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=marketplace">Marketplace</a></strong>
-      <br />Start from proven agents, add one to your library, and customize it for your work.
-    </td>
-    <td width="50%" align="center" valign="top">
-      <a href="https://agpt.co/product/build/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=build">
-        <img src="docs/content/imgs/readme/build_screen.jpg" alt="The AutoGPT Build canvas showing a real agent workflow" />
-      </a>
-      <br /><strong><a href="https://agpt.co/product/build/?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=build">Build</a></strong>
-      <br />Drag, connect, branch, and inspect blocks for exact control over every step.
-    </td>
-  </tr>
-</table>
+### Auto-generated (env group `autogpt-platform-secrets`)
 
----
+Created once by Render and shared across services via `fromGroup`; you never set these by hand.
 
-## Get started
+| Key | Used by | Notes |
+|-----|---------|-------|
+| `JWT_VERIFY_KEY` | rest, ws, scheduler, db-manager, GoTrue | HS256 secret; copied into GoTrue's `GOTRUE_JWT_SECRET`. |
+| `UNSUBSCRIBE_SECRET_KEY` | rest | Signs email unsubscribe links. |
 
-### AutoGPT Platform — public, hosted, and managed
+> `ENCRYPTION_KEY` is **not** auto-generated — Render's `generateValue` is not guaranteed to
+> be a valid Fernet key. It is deployer-supplied instead (see the table below).
 
-The hosted Platform is publicly available. We manage the infrastructure, model access, credentials, reliability, and updates so you can focus on the work your agents perform.
+### Deployer-supplied (Dashboard prompts, `sync: false`)
 
-**[Get started on AutoGPT Platform →](https://platform.agpt.co/signup?utm_source=github&utm_medium=referral&utm_campaign=autogpt_readme&utm_content=platform_get_started)**
+`sync: false` is ignored inside env groups, so these live on individual services and are
+entered in the Dashboard at deploy time.
 
-[Take the interactive tour →](https://platform.agpt.co/tour?utm_source=github&utm_medium=referral&utm_campaign=autogpt_readme&utm_content=tour_get_started)
+| Key | Service(s) | What to enter |
+|-----|-----------|---------------|
+| `ENCRYPTION_KEY` | rest, ws, scheduler, db-manager, **Workflow** | Fernet key for stored credentials — **generate once, paste the identical value into all 5** (see below) |
+| `RENDER_API_KEY` | rest-server, scheduler-server | Render workspace API key (Workflows dispatch) |
+| `RENDER_WORKFLOW_SLUG` | rest-server, scheduler-server | Slug of the manual executor Workflow — **unknown until it exists**; set + redeploy |
+| `PLATFORM_BASE_URL` | rest-server | Backend (rest-server) public origin |
+| `FRONTEND_BASE_URL` | rest-server | Frontend public origin |
+| `BACKEND_CORS_ALLOW_ORIGINS` | rest-server, websocket-server | JSON array, e.g. `["https://your-frontend.onrender.com"]` — scope to the frontend origin only |
+| `NEXT_PUBLIC_AGPT_SERVER_URL` | frontend | `https://<rest-server host>/api` (build-time) |
+| `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend | `wss://<websocket-server host>/ws` (build-time) |
+| `NEXT_PUBLIC_SUPABASE_URL` | frontend | The **frontend's own** public origin (auth proxies through it) |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | frontend | Anon JWT signed with `JWT_VERIFY_KEY` (see below) |
+| `NEXT_PUBLIC_FRONTEND_BASE_URL` | frontend | The frontend's own public origin |
+| `GOTRUE_SITE_URL`, `GOTRUE_API_EXTERNAL_URL`, `GOTRUE_URI_ALLOW_LIST` | gotrue | Frontend origin + allowed redirect URLs |
+| `GOTRUE_SMTP_*` | gotrue | SMTP host/port/user/pass/sender/admin (email confirm, reset, change) |
+| `GOTRUE_EXTERNAL_GOOGLE_*` | gotrue | Optional Google OAuth (leave `ENABLED=false` to skip) |
 
-- AutoPilot, Agents, Marketplace, and Build
-- 45+ connected platforms and hundreds of AI models
-- No model API keys or infrastructure setup
-- Agents that run on demand, on schedules, and from triggers
+The authoritative list of deployer-supplied values is [`render.yaml`](render.yaml) itself —
+every one is a `sync: false` entry annotated with a `# DEPLOYER:` comment, and Render prompts
+for them when you deploy the Blueprint. The table above is the human-readable summary.
 
-The hosted Platform is a paid service with usage-based agent runs. [Compare plans and pricing →](https://agpt.co/pricing?utm_source=github&utm_medium=referral&utm_campaign=autogpt_readme&utm_content=platform_pricing)
+> **Local development** does not use this table — it runs from the committed `.env.default`
+> files via `make init-env`. See [`local.md`](local.md#environment-files).
 
-### Self-host AutoGPT
+#### Generating the anon key
 
-> [!NOTE]
-> Self-hosting is the free path. You provide the infrastructure and model API keys, and you maintain the deployment. If you want zero setup, use the [managed Platform](https://platform.agpt.co/signup?utm_source=github&utm_medium=referral&utm_campaign=autogpt_readme&utm_content=self_host_note).
+`NEXT_PUBLIC_SUPABASE_ANON_KEY` is a JWT signed with `JWT_VERIFY_KEY` (read the generated
+value from the env group after the first deploy):
 
-**macOS and Linux:**
+```
+header:  {"alg":"HS256","typ":"JWT"}
+payload: {"role":"anon","iss":"supabase","aud":"authenticated"}
+```
+
+Sign it with the group's `JWT_VERIFY_KEY` (e.g. via jwt.io). For a no-Kong deploy any
+non-empty value works, but a correct anon JWT is recommended.
+
+#### Generating `ENCRYPTION_KEY`
+
+The backend loads `ENCRYPTION_KEY` as a `cryptography.fernet.Fernet` key — it must be
+url-safe base64 of exactly 32 bytes, which Render's `generateValue` does **not** guarantee
+(it can emit `+`/`/` chars that Fernet rejects). So it is deployer-supplied. Generate **one**
+key and paste that **identical** value into all five places (`rest-server`,
+`websocket-server`, `scheduler-server`, `database-manager`, and the executor Workflow):
 
 ```bash
-curl -fsSL https://setup.agpt.co/install.sh -o install.sh && bash install.sh
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-**Windows PowerShell:**
-
-```powershell
-powershell -c "iwr https://setup.agpt.co/install.bat -o install.bat; ./install.bat"
-```
-
-[Read the self-hosting guide →](https://docs.agpt.co/platform/getting-started)
+Each backend service logs a non-secret fingerprint at boot —
+`ENCRYPTION_KEY loaded (fingerprint=<12 hex chars>)`. Confirm every service prints the
+**same** fingerprint; a mismatch means a service has a different key and credential
+decryption will fail. If `ENCRYPTION_KEY` is malformed, the service fails fast at startup
+with a clear error instead of an opaque runtime `InvalidToken`.
 
 ---
 
-## Managed Platform vs. self-hosting
+## Deploy
 
-| | **AutoGPT Platform** | **Self-hosted** |
-|---|---|---|
-| Access | Public signup | Clone and install |
-| Cost | Paid plan plus agent usage | No license fee; pay your own infrastructure and model providers |
-| Setup | Managed | Docker and configuration required |
-| Model access | Built in | Bring your own API keys |
-| Updates and operations | Managed by AutoGPT | Managed by you |
-| Core builder and agent runtime | Included | Included |
-| Data and infrastructure control | Hosted by AutoGPT | Runs on your infrastructure |
-| Support | Plan-dependent | Community support |
+1. **Fork** this repo and push it to your GitHub/GitLab account.
+2. In Render, **New → Blueprint**, select your fork. Render reads `render.yaml`.
+3. Fill in the `sync: false` prompts you already know (SMTP, CORS placeholders, etc.).
+   The frontend `NEXT_PUBLIC_*` URLs depend on the service hostnames — you can set
+   placeholders now and correct them in step 5.
+4. **Apply.** Postgres, Key Value, GoTrue, ClamAV, the four backend services, the cron,
+   and the frontend come up. `rest-server` runs `prisma migrate deploy` on predeploy.
+5. **Set the real public URLs.** Once services have their `*.onrender.com` hostnames (or
+   your custom domains), set on the **frontend**: `NEXT_PUBLIC_AGPT_SERVER_URL`,
+   `NEXT_PUBLIC_AGPT_WS_SERVER_URL`, `NEXT_PUBLIC_SUPABASE_URL`,
+   `NEXT_PUBLIC_FRONTEND_BASE_URL`; and on **gotrue**: `GOTRUE_SITE_URL`,
+   `GOTRUE_API_EXTERNAL_URL`, `GOTRUE_URI_ALLOW_LIST`; and `PLATFORM_BASE_URL` /
+   `FRONTEND_BASE_URL` / `BACKEND_CORS_ALLOW_ORIGINS` on the backend. Redeploy the frontend
+   (its `NEXT_PUBLIC_*` are inlined at build time).
 
-Both paths use the same repository. Choose the managed Platform when you want agents running immediately; self-host when infrastructure control matters more than operational convenience.
+### Manual step — the executor Workflow
 
----
+The executor runs as a Render **Workflow**, which Blueprints cannot declare. After Postgres
+and Key Value exist:
 
-## Why the hosted Platform is paid
+1. **New → Workflow**, link this repo, same workspace + region.
+2. **Root Directory:** `autogpt_platform/backend`
+   **Build Command:** `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`
+   **Start Command:** `poetry run python -m backend.workflows.main`
+3. Give it the same DB / Redis / secret wiring as the backend (`DATABASE_URL` +
+   `DIRECT_URL` with `?schema=platform`, `REDIS_URL` from the Key Value connection string
+   (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
+   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY`, and the **same
+   deployer-generated `ENCRYPTION_KEY` you set on the backend services** (confirm the boot
+   fingerprint matches), plus provider API keys your graphs use).
+4. Deploy it, copy its slug (task id shows as `{slug}/run_graph_execution`).
+5. Set `RENDER_WORKFLOW_SLUG` (+ `RENDER_API_KEY`, `EXECUTION_BACKEND=workflows`) on
+   `rest-server` and `scheduler-server`, then redeploy those two.
 
-Every agent run consumes real model usage, compute, storage, secrets management, and operational support. The managed Platform covers that infrastructure and funds continued development of the open-source project.
+### Manual step — LLM / Claude API keys
 
-Self-hosting remains available without a license fee for people and teams that want to provide and operate those resources themselves.
+Two features need an LLM credential: **copilot chat** (`/api/chat/*`, on `rest-server`)
+and the **AI blocks** (AI Text Generator, `claude_code`, `orchestrator`, on the executor
+Workflow). **The deploy succeeds with no key set** — copilot chat and AI blocks simply
+return nothing until one is present, so this step is optional-but-required-for-those-features.
 
----
+Because `sync: false` is invalid inside env groups and the executor Workflow isn't a
+Blueprint resource, these keys are **not** in `render.yaml`. Instead use one
+Dashboard-managed env group read by both consumers, so each key is entered exactly once:
 
-## What you can automate
+1. **Create the env group.** Dashboard → Env Groups → New → name it
+   **`autogpt-platform-llm`**. (Dashboard-managed; do **not** add it to `render.yaml`.)
+2. **Add the keys for the transport you want** (pick one):
 
-| Area | Example |
-|---|---|
-| **Executive operations** | Prepare a daily brief from internal and external signals |
-| **Sales** | Research every account before tomorrow's meetings |
-| **Marketing** | Turn a launch brief into campaign drafts across channels |
-| **Engineering** | Triage incidents and start with a likely cause |
-| **Customer support** | Draft replies, collect context, and flag escalations |
-| **Research** | Monitor sources and return structured reports when something changes |
+   | Transport | Env to set | Render? |
+   |-----------|-----------|---------|
+   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`) | ✅ |
+   | Direct Anthropic | `ANTHROPIC_API_KEY=<key>` **and** `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅ |
+   | Subscription (`claude login`) | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true` | ⚠️ advanced/dev only (see Notes) |
 
----
-
-## Integrations
-
-Connect the apps that are yours. AutoGPT provides access to hundreds of AI models and connects agents to 45+ platforms, including:
-
-`Gmail` · `Google Calendar` · `Google Docs` · `Google Sheets` · `GitHub` · `Slack` · `Discord` · `Notion` · `HubSpot` · `Linear` · `Airtable` · `Jira` · `Salesforce` · `Stripe` · `Webflow`
-
-[Explore the integrations →](https://agpt.co/docs/integrations)
-
----
-
-## Community and support
-
-| Resource | Link |
-|---|---|
-| Discord | [Join the AutoGPT community](https://discord.gg/autogpt) |
-| Documentation | [docs.agpt.co](https://docs.agpt.co) |
-| Bug reports | [GitHub Issues](https://github.com/Significant-Gravitas/AutoGPT/issues/new/choose) |
-| Feature requests | [GitHub Discussions](https://github.com/Significant-Gravitas/AutoGPT/discussions) |
-| Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
-
----
-
-## License
-
-| Component | License | What it means |
-|---|---|---|
-| `autogpt_platform/` | [Polyform Shield](https://polyformproject.org/licenses/shield/1.0.0/) | Free for personal and internal business use; cannot be sold as a competing hosted service |
-| `classic/` and everything else | [MIT](LICENSE) | Permissive open-source use |
+   Also add `OPENAI_API_KEY=<key>` if OpenAI-based blocks will be used (it also serves as
+   the OpenRouter fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
+3. **Link the group to both LLM consumers:** the **rest-server** web service (copilot chat)
+   and the **executor Workflow** (AI blocks). For each: service/Workflow → Environment →
+   Link Environment Group → `autogpt-platform-llm` → save & redeploy.
+4. Because both services share the group, **the same key value is read by rest-server and
+   the Workflow — you enter it exactly once.**
 
 ---
 
-## AutoGPT Classic
+## Using the app
 
-Looking for the original standalone AutoGPT agent? It remains available in [`classic/`](classic/) under the MIT License.
-
-- [Build an agent with Forge](classic/FORGE-QUICKSTART.md)
-- [Benchmark an agent with `agbenchmark`](https://pypi.org/project/agbenchmark/)
-- [Explore the Classic project](classic/README.md)
-
----
-
-## Contributors
-
-<a href="https://github.com/Significant-Gravitas/AutoGPT/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Significant-Gravitas/AutoGPT&max=1000&columns=10" alt="AutoGPT contributors" />
-</a>
-
-<p align="center">
-  <a href="https://platform.agpt.co/signup?utm_source=github&amp;utm_medium=referral&amp;utm_campaign=autogpt_readme&amp;utm_content=footer_get_started"><strong>Get started with AutoGPT →</strong></a>
-</p>
+1. Open the frontend URL and **sign up**. GoTrue sends confirmation email via your SMTP
+   (or set `GOTRUE_MAILER_AUTOCONFIRM=true` on gotrue for a no-SMTP demo).
+2. Log in, open the **Builder**, and create or import an agent graph.
+3. **Run** the agent — `rest-server` dispatches to the executor Workflow via
+   `start_task`; progress streams back over the websocket-server.
+4. Browse the **Marketplace** to try shared agents. File uploads are virus-scanned by
+   ClamAV before processing.
 
 ---
 
-<!-- Keep these links. Translations will automatically update with the README. -->
-[Deutsch](https://zdoc.app/de/Significant-Gravitas/AutoGPT) |
-[Español](https://zdoc.app/es/Significant-Gravitas/AutoGPT) |
-[français](https://zdoc.app/fr/Significant-Gravitas/AutoGPT) |
-[日本語](https://zdoc.app/ja/Significant-Gravitas/AutoGPT) |
-[한국어](https://zdoc.app/ko/Significant-Gravitas/AutoGPT) |
-[Português](https://zdoc.app/pt/Significant-Gravitas/AutoGPT) |
-[Русский](https://zdoc.app/ru/Significant-Gravitas/AutoGPT) |
-[中文](https://zdoc.app/zh/Significant-Gravitas/AutoGPT)
+## Local development
+
+To run the stack on your own machine — full Docker or core-in-Docker with the app
+native and hot-reloading — see [`local.md`](local.md). Local dev uses the repo's
+`docker-compose.yml` and the **RabbitMQ** execution backend, **not** Render Workflows
+(`EXECUTION_BACKEND=workflows` is a deploy-only concern handled by `render.yaml`).
+You can still exercise the Workflows path locally before deploying — see
+[Verify it — run a graph through Workflows](local.md#verify-it--run-a-graph-through-workflows).
+
+Unlike the single Dashboard env groups used for the Render deploy above, local dev reads
+**three separate `.env` files** — `backend/.env` (all backend services, incl. LLM/copilot
+keys), `frontend/.env` (browser `NEXT_PUBLIC_*` only), and the root `.env` (Compose +
+Supabase infra). Put each key in the file whose services need it, and recreate the affected
+containers after editing. See [Environment files](local.md#environment-files) in `local.md`.
+
+---
+
+## Notes & tradeoffs
+
+- **Region/workspace:** every resource is in `oregon` in one workspace — required for
+  private DNS (`fromService`/`fromDatabase`).
+- **Redis standalone:** `REDIS_CLUSTER_MODE=false` selects the standalone client path;
+  Key Value uses `noeviction` so locks/queued turns are never dropped.
+- **Migrations:** only `rest-server` runs `prisma migrate deploy` (predeploy). No other
+  service migrates.
+- **Broker not fully gone:** RabbitMQ is still used by copilot-executor and the
+  notification server (both out of scope for this template); only graph execution moved
+  to Workflows.
+- **Scaling:** `scheduler-server` and `database-manager` stay at `numInstances: 1`.
+  `clamav` has a disk, so it can't scale horizontally. Re-budget `DB_CONNECTION_LIMIT`
+  before raising instance counts.
+- **Claude subscription transport (`CHAT_USE_CLAUDE_CODE_SUBSCRIPTION`):** advanced/dev
+  only. It needs `claude login` OAuth tokens persisted under the CLI config dir
+  (`$HOME/.claude` / `CLAUDE_CONFIG_DIR`), which an ephemeral container loses on redeploy.
+  Running it on Render would require a persistent disk on rest-server at the CLI config dir
+  (forcing single-instance, no zero-downtime deploys) plus a one-time `claude login` over
+  SSH. Prefer the OpenRouter or direct-Anthropic transports for deployments.
+
+For the AutoGPT product, docs, and community, see the
+[upstream repository](https://github.com/Significant-Gravitas/AutoGPT) and
+[docs.agpt.co](https://docs.agpt.co).
