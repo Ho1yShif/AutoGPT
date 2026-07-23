@@ -1109,6 +1109,48 @@ async def test_stop_graph_execution_cascades_to_child_with_reviews(
     assert mock_execution_db.update_graph_execution_stats.call_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_stop_graph_execution_rejects_non_owner_before_signalling(
+    mocker: MockerFixture,
+):
+    """A caller who doesn't own the execution must get NotFoundError and must
+    NOT emit any cancel signal — even with wait_timeout=0, which returns before
+    the wait loop's ownership-scoped read. `request_cancel` / the RabbitMQ
+    fan-out are unauthenticated primitives, so this up-front ownership check is
+    the only thing preventing cross-tenant termination."""
+    from backend.executor.utils import stop_graph_execution
+    from backend.util.exceptions import NotFoundError
+
+    mock_prisma = mocker.patch("backend.executor.utils.prisma")
+    mock_prisma.is_connected.return_value = True
+
+    # Ownership-scoped lookup returns None (not the caller's execution).
+    mock_execution_db = mocker.patch("backend.executor.utils.execution_db")
+    mock_execution_db.get_graph_execution_meta = mocker.AsyncMock(return_value=None)
+
+    mock_get_queue = mocker.patch("backend.executor.utils.get_async_execution_queue")
+    mock_queue_client = mocker.AsyncMock()
+    mock_get_queue.return_value = mock_queue_client
+
+    mock_request_cancel = mocker.patch(
+        "backend.executor.utils.wf_cancel.request_cancel"
+    )
+    mock_get_children = mocker.patch("backend.executor.utils._get_child_executions")
+
+    with pytest.raises(NotFoundError):
+        await stop_graph_execution(
+            user_id="not-the-owner",
+            graph_exec_id="someone-elses-exec",
+            wait_timeout=0,  # would skip the wait-loop ownership read
+            cascade=True,
+        )
+
+    # No cancel signal on either backend, and no cascade to children.
+    mock_queue_client.publish_message.assert_not_called()
+    mock_request_cancel.assert_not_called()
+    mock_get_children.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Credential validation error marker parity.
 #

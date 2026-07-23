@@ -9,8 +9,10 @@
 # lives in exactly one place. Both the wheel and sdist hashes are listed so
 # pip can install from either under --require-hashes.
 #
-# Keep in sync with the Render Workflow service's own build command
-# (Stream C, Dashboard).
+# The Dockerfile server stage and the manual Render Workflow service both
+# install via `pip install --no-deps --require-hashes -r
+# render_sdk.requirements.txt`, so neither restates the version — this file is
+# the only place the pin appears.
 render_sdk==0.7.0 \
     --hash=sha256:5e17c4dced6e6cb57301aa692a462dd580766f9cc5a98d451a026a62bda3d136 \
     --hash=sha256:f8ea516be179504495f2e169526c204321d80c46b7ec03ee81d7279e4ec024c4
