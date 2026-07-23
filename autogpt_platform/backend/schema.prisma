@@ -791,6 +791,11 @@ model AgentGraphExecution {
 
   stats Json?
 
+  // Render Workflows: the task run id returned by start_task, persisted so a
+  // later stop_graph_execution can cancel the run via the Render SDK. Null when
+  // EXECUTION_BACKEND=rabbitmq (broker path) or before the run is dispatched.
+  renderRunId String?
+
   // Parent-child execution tracking for nested agent graphs
   parentGraphExecutionId String?
   ParentExecution        AgentGraphExecution?  @relation("ParentChildExecution", fields: [parentGraphExecutionId], references: [id], onDelete: SetNull)

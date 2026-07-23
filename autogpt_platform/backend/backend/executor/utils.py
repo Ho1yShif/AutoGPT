@@ -5,7 +5,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future
-from typing import Literal, Mapping, Optional, cast
+from typing import Literal, Mapping, Optional, Protocol, cast
 
 from pydantic import BaseModel, JsonValue, ValidationError
 
@@ -29,6 +29,7 @@ from backend.data.dynamic_fields import merge_execution_input
 from backend.data.execution import (
     ExecutionContext,
     ExecutionStatus,
+    GraphExecutionEntry,
     GraphExecutionMeta,
     GraphExecutionStats,
     GraphExecutionWithNodes,
@@ -42,6 +43,7 @@ from backend.data.model import (
     NodeExecutionStats,
 )
 from backend.data.rabbitmq import Exchange, ExchangeType, Queue, RabbitMQConfig
+from backend.data.redis_helpers import SlotAdmission
 from backend.util.clients import (
     get_async_execution_event_bus,
     get_async_execution_queue,
@@ -56,6 +58,10 @@ from backend.util.exceptions import (
 from backend.util.logging import TruncatedLogger, is_structured_logging_enabled
 from backend.util.settings import Config
 from backend.util.type import coerce_inputs_to_schema
+from backend.workflows import cancel as wf_cancel
+from backend.workflows import client as wf_client
+from backend.workflows import entry_store as wf_entry_store
+from backend.workflows import rate_limit as wf_rate_limit
 
 config = Config()
 logger = TruncatedLogger(logging.getLogger(__name__), prefix="[GraphExecutorUtil]")
@@ -1057,10 +1063,12 @@ async def stop_graph_execution(
     Stop a graph execution and optionally all its child executions.
 
     Mechanism:
-    1. Set the cancel event for this execution
-    2. If cascade=True, recursively stop all child executions
-    3. Graph executor's cancel handler thread detects the event, terminates workers,
-       reinitializes worker pool, and returns.
+    1. Authorize the caller, then signal cancellation cooperatively — set the
+       polled Redis cancel flag (`wf_cancel.request_cancel`) on the workflows
+       backend, or publish the RabbitMQ cancel fan-out on the broker backend.
+    2. If cascade=True, recursively stop all child executions.
+    3. The executor detects the signal, terminates workers, reinitializes the
+       worker pool, and returns.
     4. Update execution statuses in DB and set `error` outputs to `"TERMINATED"`.
 
     Args:
@@ -1069,8 +1077,19 @@ async def stop_graph_execution(
         wait_timeout: Maximum time to wait for execution to stop (seconds)
         cascade: If True, recursively stop all child executions
     """
-    queue_client = await get_async_execution_queue()
+    use_workflows = config.execution_backend == "workflows"
     db = execution_db if prisma.is_connected() else get_database_manager_async_client()
+
+    # Authorize FIRST: verify the caller owns this execution before emitting any
+    # cancel signal or cascading. `request_cancel` / the RabbitMQ fan-out are
+    # unauthenticated primitives, and when `wait_timeout` is falsy we return
+    # before the wait loop's ownership-scoped read ever runs — so without this
+    # up-front check a caller could terminate another tenant's execution.
+    graph_exec = await db.get_graph_execution_meta(
+        execution_id=graph_exec_id, user_id=user_id
+    )
+    if not graph_exec:
+        raise NotFoundError(f"Graph execution #{graph_exec_id} not found.")
 
     # First, find and stop all child executions if cascading
     if cascade:
@@ -1094,12 +1113,20 @@ async def stop_graph_execution(
                 return_exceptions=True,  # Don't fail parent stop if child stop fails
             )
 
-    # Now stop this execution
-    await queue_client.publish_message(
-        routing_key="",
-        message=CancelExecutionEvent(graph_exec_id=graph_exec_id).model_dump_json(),
-        exchange=GRAPH_EXECUTION_CANCEL_EXCHANGE,
-    )
+    # Now signal cancellation of this execution. Both paths are COOPERATIVE:
+    # the running engine flips DB status to TERMINATED, cancels reviews, and
+    # (via this function's recursion above) cascades to children.
+    if use_workflows:
+        # No FANOUT broadcast on the workflows path — set the polled Redis flag
+        # the running task watches (see backend.workflows.cancel).
+        await wf_cancel.request_cancel(graph_exec_id)
+    else:
+        queue_client = await get_async_execution_queue()
+        await queue_client.publish_message(
+            routing_key="",
+            message=CancelExecutionEvent(graph_exec_id=graph_exec_id).model_dump_json(),
+            exchange=GRAPH_EXECUTION_CANCEL_EXCHANGE,
+        )
 
     if not wait_timeout:
         return
@@ -1162,10 +1189,83 @@ async def stop_graph_execution(
         if graph_exec.status == ExecutionStatus.RUNNING:
             await asyncio.sleep(0.1)
 
+    # Cooperative shutdown didn't complete within the window. On the workflows
+    # path, fall back to a best-effort HARD kill of the task run (skips the
+    # graceful DB cleanup, hence a backstop only).
+    if use_workflows:
+        render_run_id = await db.get_render_run_id(graph_exec_id)
+        if render_run_id:
+            await wf_client.cancel_graph_execution_run(render_run_id)
+
     raise TimeoutError(
         f"Graph execution #{graph_exec_id} will need to take longer than {wait_timeout} seconds to stop. "
         f"You can check the status of the execution in the UI or try again later."
     )
+
+
+class _RenderRunIdSetter(Protocol):
+    """Structural type for the DB handle `_dispatch_via_workflows` writes through.
+
+    Both the `backend.data.execution` module and `DatabaseManagerAsyncClient`
+    expose `set_render_run_id`; this Protocol makes that the explicit contract
+    instead of relying on untyped duck-typing.
+    """
+
+    async def set_render_run_id(
+        self, graph_exec_id: str, render_run_id: str
+    ) -> None: ...
+
+
+async def _dispatch_via_workflows(
+    graph_exec_entry: GraphExecutionEntry,
+    user_id: str,
+    edb: _RenderRunIdSetter,
+) -> None:
+    """Dispatch a graph execution to Render Workflows (EXECUTION_BACKEND=workflows).
+
+    Enforces the per-user concurrency cap app-side (no native equivalent),
+    stores the full entry in Redis (4 MB task-arg cap → pass ids only), starts
+    the Workflow task run, and persists its run id for later cancellation.
+    """
+    graph_exec_id = graph_exec_entry.graph_exec_id
+
+    admission = await wf_rate_limit.acquire_run_slot(user_id, graph_exec_id)
+    if admission == SlotAdmission.REJECTED:
+        raise wf_rate_limit.ExecutionRateLimitError(
+            f"User {user_id} is at the concurrent-execution limit "
+            f"({config.max_concurrent_graph_executions_per_user}); "
+            "try again once a running execution finishes."
+        )
+    # Only a newly-ADMITTED slot is owned by this call. A REFRESHED slot belongs
+    # to the still-running original run (resume/requeue of the same exec id);
+    # releasing it on dispatch failure would drop a slot that run still needs.
+    owns_slot = admission == SlotAdmission.ADMITTED
+    render_run_id: str | None = None
+    try:
+        await wf_entry_store.store_execution_entry(graph_exec_entry)
+        render_run_id = await wf_client.dispatch_graph_execution(graph_exec_id, user_id)
+        # A returned run id is the point of no return: the task is now (about to
+        # be) RUNNING. Persist the id as the LAST fallible step so a failure here
+        # is handled as "already dispatched" below, not as "release the slot".
+        await edb.set_render_run_id(graph_exec_id, render_run_id)
+        logger.info(
+            f"Dispatched execution {graph_exec_id} to Render Workflows "
+            f"(run_id={render_run_id})"
+        )
+    except BaseException:
+        if render_run_id is not None:
+            # Dispatch already returned a run id, so the task is running and holds
+            # the slot — releasing it would under-count the cap. Worse, if
+            # `set_render_run_id` was the failing step the id was never persisted,
+            # so the normal stop-path hard-kill fallback (get_render_run_id) could
+            # never cancel it. Best-effort hard-cancel the orphaned run instead;
+            # its own `finally` (or the run-artifact TTL) reclaims the slot/entry.
+            await wf_client.cancel_graph_execution_run(render_run_id)
+        elif owns_slot:
+            # Failed before dispatch returned an id: free the slot we reserved
+            # (but never release a slot the still-running original run owns).
+            await wf_rate_limit.release_run_slot(user_id, graph_exec_id)
+        raise
 
 
 async def add_graph_execution(
@@ -1373,15 +1473,19 @@ async def add_graph_execution(
 
         graph_exec.status = ExecutionStatus.QUEUED
 
-        # Publish to execution queue for executor to pick up
-        # This happens AFTER status update to ensure only one request publishes
-        exec_queue = await get_async_execution_queue()
-        await exec_queue.publish_message(
-            routing_key=GRAPH_EXECUTION_ROUTING_KEY,
-            message=graph_exec_entry.model_dump_json(),
-            exchange=GRAPH_EXECUTION_EXCHANGE,
-        )
-        logger.info(f"Published execution {graph_exec.id} to RabbitMQ queue")
+        # Dispatch to the configured backend. This happens AFTER the status
+        # update to ensure only one request publishes/dispatches.
+        if config.execution_backend == "workflows":
+            await _dispatch_via_workflows(graph_exec_entry, user_id, edb)
+        else:
+            # Publish to RabbitMQ for the ExecutionManager to pick up.
+            exec_queue = await get_async_execution_queue()
+            await exec_queue.publish_message(
+                routing_key=GRAPH_EXECUTION_ROUTING_KEY,
+                message=graph_exec_entry.model_dump_json(),
+                exchange=GRAPH_EXECUTION_EXCHANGE,
+            )
+            logger.info(f"Published execution {graph_exec.id} to RabbitMQ queue")
     except BaseException as e:
         err = str(e) or type(e).__name__
         if not graph_exec:

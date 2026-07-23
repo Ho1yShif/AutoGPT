@@ -1057,6 +1057,24 @@ async def update_graph_execution_start_time(
     return GraphExecution.from_db(res) if res else None
 
 
+async def set_render_run_id(graph_exec_id: str, render_run_id: str) -> None:
+    """Persist the Render Workflows task run id for a graph execution.
+
+    Used only on the EXECUTION_BACKEND=workflows path so a later
+    stop_graph_execution can cancel the run via the Render SDK.
+    """
+    await AgentGraphExecution.prisma().update(
+        where={"id": graph_exec_id},
+        data={"renderRunId": render_run_id},
+    )
+
+
+async def get_render_run_id(graph_exec_id: str) -> str | None:
+    """Read the Render Workflows task run id for a graph execution, if any."""
+    res = await AgentGraphExecution.prisma().find_unique(where={"id": graph_exec_id})
+    return res.renderRunId if res else None
+
+
 TERMINAL_GRAPH_EXECUTION_STATUSES = (
     ExecutionStatus.COMPLETED,
     ExecutionStatus.FAILED,
