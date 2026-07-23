@@ -127,10 +127,13 @@ real value in the Dashboard and it overrides the derived default.
 
 1. **Before / at apply — values you already control:** `ENCRYPTION_KEY` (generate once,
    enter it **only on rest-server** — ws/scheduler/db-manager pull it via `fromService`;
-   the manual Workflow gets the same value pasted separately), `RENDER_API_KEY` (rest +
-   scheduler), and SMTP (`GOTRUE_SMTP_*`) if you have it. For the URL-dependent keys below,
-   enter a **valid `https://` placeholder** now (e.g. `https://example.com`) — an empty or
-   malformed value fails URL/CORS validation at boot.
+   the manual Workflow gets the same value pasted separately), `RENDER_API_KEY` (once, on
+   rest-server — scheduler pulls it via `fromService`), `RENDER_WORKFLOW_SLUG` (once, on
+   rest-server — the slug of the executor Workflow you create **first**; see
+   [Manual step — the executor Workflow](#manual-step--the-executor-workflow)), and SMTP
+   (`GOTRUE_SMTP_*`) if you have it. For the URL-dependent keys below, enter a **valid
+   `https://` placeholder** now (e.g. `https://example.com`) — an empty or malformed value
+   fails URL/CORS validation at boot.
 2. **After the first apply — values that need the `*.onrender.com` hostnames:** on the
    **frontend**, `NEXT_PUBLIC_AGPT_SERVER_URL` (`https://<rest-server host>/api`),
    `NEXT_PUBLIC_AGPT_WS_SERVER_URL` (`wss://<websocket-server host>/ws`), and
@@ -142,8 +145,6 @@ real value in the Dashboard and it overrides the derived default.
    `PLATFORM_BASE_URL`, `BACKEND_CORS_ALLOW_ORIGINS`, `NEXT_PUBLIC_SUPABASE_URL`,
    `NEXT_PUBLIC_FRONTEND_BASE_URL`, and GoTrue's `GOTRUE_SITE_URL` /
    `GOTRUE_API_EXTERNAL_URL` are **derived — do not enter them**.
-3. **After the Workflow exists:** `RENDER_WORKFLOW_SLUG` (rest + scheduler), then redeploy
-   those two. See [Manual step — the executor Workflow](#manual-step--the-executor-workflow).
 
 ### The full deployer-supplied list (bucket 3)
 
@@ -152,8 +153,8 @@ These live on individual services and are required to enter in the Dashboard at 
 | Key | Service(s) | What to enter |
 |-----|-----------|---------------|
 | `ENCRYPTION_KEY` | rest-server (+ **Workflow**) | Fernet key for stored credentials — **enter once on rest-server**; ws/scheduler/db-manager pull it via `fromService`. Generate with: `python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"` and paste the **same value** into the manual Workflow too |
-| `RENDER_API_KEY` | rest-server, scheduler-server | Render workspace API key (Workflows dispatch) |
-| `RENDER_WORKFLOW_SLUG` | rest-server, scheduler-server | Slug of the manual executor Workflow — **unknown until it exists**; set + redeploy |
+| `RENDER_API_KEY` | rest-server (+ **Workflow**) | Render workspace API key (Workflows dispatch) — **enter once on rest-server**; scheduler pulls it via `fromService`. The manual Workflow needs it too |
+| `RENDER_WORKFLOW_SLUG` | rest-server | Slug of the executor Workflow — **enter once on rest-server**; scheduler pulls it via `fromService`. Create the Workflow **first** (below) so the slug is known at apply time |
 | `FRONTEND_BASE_URL` | rest-server | Frontend public origin — **the single backend URL keyname**; ws/scheduler/db-manager pull it via `fromService`, and `PLATFORM_BASE_URL` + `BACKEND_CORS_ALLOW_ORIGINS` are derived from it |
 | `NEXT_PUBLIC_AGPT_SERVER_URL` | frontend | `https://<rest-server host>/api` (build-time) |
 | `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend | `wss://<websocket-server host>/ws` (build-time) |
@@ -231,56 +232,74 @@ Follow the buckets from [Secrets & environment](#secrets--environment) in order:
 1. **Fork** this repo and push it to your GitHub/GitLab account.
 2. **Generate `ENCRYPTION_KEY` first** (see [below](#generating-encryption_key)) and grab
    your `RENDER_API_KEY` from Dashboard → Settings → API Keys. You'll paste these into the
-   Blueprint prompts in the next step — having them ready avoids a second pass.
-3. In Render, **New → Blueprint**, select your fork. Render reads `render.yaml` and prompts
-   for every `sync: false` key (bucket 3).
-4. **Fill the bucket-3 "phase 1" prompts** — `ENCRYPTION_KEY` (once, on rest-server only),
-   `RENDER_API_KEY` (rest + scheduler), and SMTP if you have it. For the URL-dependent keys
-   (`FRONTEND_BASE_URL`, the frontend `NEXT_PUBLIC_AGPT_*`, `GOTRUE_URI_ALLOW_LIST`, anon
-   key) enter a **valid `https://` placeholder** now (e.g. `https://example.com`) — you
-   can't know the hostnames yet, and an empty value fails URL/CORS validation at boot. Leave
-   `RENDER_WORKFLOW_SLUG` as a placeholder. You are **not** prompted for the derived/wired
-   vars (`PLATFORM_BASE_URL`, `BACKEND_CORS_ALLOW_ORIGINS`, `NEXT_PUBLIC_SUPABASE_URL`,
-   `NEXT_PUBLIC_FRONTEND_BASE_URL`, `GOTRUE_SITE_URL`, `GOTRUE_API_EXTERNAL_URL`, or
-   `ENCRYPTION_KEY` on the three consumer services).
+   Blueprint prompts — having them ready avoids a second pass.
+3. **Create the executor Workflow *shell* first** so its slug is known before you apply the
+   Blueprint. Follow [Manual step — the executor Workflow, part A](#manual-step--the-executor-workflow):
+   create it, note its slug, and **expect its first deploy to fail** — it has no DB/Redis/JWT
+   yet (those are created by the Blueprint in step 5). You only need the slug for now.
+4. In Render, **New → Blueprint**, select your fork. Render reads `render.yaml` and prompts
+   for every `sync: false` key (bucket 3). **Fill the "phase 1" prompts** —
+   `ENCRYPTION_KEY` (once, on rest-server), `RENDER_API_KEY` (once, on rest-server),
+   `RENDER_WORKFLOW_SLUG` (once, on rest-server — the slug from step 3), and SMTP if you have
+   it. For the URL-dependent keys (`FRONTEND_BASE_URL`, the frontend `NEXT_PUBLIC_AGPT_*`,
+   anon key) enter a **valid `https://` placeholder** (e.g. `https://example.com`,
+   `https://example.com/api`, `wss://example.com/ws`, and any non-empty string for the anon
+   key) — you can't know the hostnames yet, and an empty value fails URL/CORS validation at
+   boot / the frontend build. `GOTRUE_URI_ALLOW_LIST`, `GOTRUE_SMTP_*`, and
+   `GOTRUE_EXTERNAL_GOOGLE_*` may be left **blank**. You are **not** prompted for the
+   derived/wired vars (`PLATFORM_BASE_URL`, `BACKEND_CORS_ALLOW_ORIGINS`,
+   `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_FRONTEND_BASE_URL`, `GOTRUE_SITE_URL`,
+   `GOTRUE_API_EXTERNAL_URL`, or `ENCRYPTION_KEY` / `RENDER_API_KEY` / `RENDER_WORKFLOW_SLUG`
+   on the consumer services — those pull from rest-server via `fromService`).
 5. **Apply.** Postgres, Key Value, GoTrue, ClamAV, the four backend services, the cron, and
    the frontend come up. Render auto-creates the `autogpt-platform-secrets` group (bucket 2)
    and the service-level `JWT_VERIFY_KEY`; `rest-server` runs `prisma migrate deploy` on
-   predeploy.
+   predeploy. Because the real `RENDER_WORKFLOW_SLUG` was baked in at step 4, there is **no
+   slug-wiring redeploy** of rest/scheduler afterwards.
 6. **Set the real public URLs (bucket 3, phase 2).** Once services have their
    `*.onrender.com` hostnames (or your custom domains), set on the **frontend**:
    `NEXT_PUBLIC_AGPT_SERVER_URL`, `NEXT_PUBLIC_AGPT_WS_SERVER_URL`, and
-   `NEXT_PUBLIC_SUPABASE_ANON_KEY` (mint from `JWT_VERIFY_KEY` — see below); on
-   **rest-server**: `FRONTEND_BASE_URL` (the frontend origin); on **gotrue**:
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY` (mint from the now-generated `JWT_VERIFY_KEY` — see below);
+   on **rest-server**: `FRONTEND_BASE_URL` (the frontend origin); on **gotrue**:
    `GOTRUE_URI_ALLOW_LIST`. Then redeploy the **frontend** (its `NEXT_PUBLIC_*` are inlined
    at build) and **rest-server** (it derives `PLATFORM_BASE_URL` / `BACKEND_CORS_ALLOW_ORIGINS`
    at start), then **gotrue** and ws/scheduler/db-manager (they pick up `FRONTEND_BASE_URL`
    — and GoTrue its `GOTRUE_SITE_URL` / `GOTRUE_API_EXTERNAL_URL` — on their next deploy).
    `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_FRONTEND_BASE_URL` are derived from the
    frontend's own origin — leave them unset unless you use a custom domain.
+7. **Finish the executor Workflow** ([part B](#manual-step--the-executor-workflow)): now that
+   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire the Workflow's env and deploy it for
+   real.
 
-Then do the two manual steps below **in order**: create the executor Workflow (sets
-`RENDER_WORKFLOW_SLUG`, bucket 3 phase 3), then create the `autogpt-platform-llm` env group
-(bucket 4) — it's created last because it links to the Workflow.
+Then create the `autogpt-platform-llm` env group (bucket 4) — see
+[Manual step — LLM / Claude API keys](#manual-step--llm--claude-api-keys).
 
 ### Manual step — the executor Workflow
 
-The executor runs as a Render **Workflow**, which Blueprints cannot declare. After Postgres
-and Key Value exist:
+The executor runs as a Render **Workflow**, which Blueprints cannot declare. It has a
+bootstrap relationship with the Blueprint: the Blueprint needs the Workflow's **slug**, and
+the Workflow needs the Blueprint's **Postgres / Key Value / `JWT_VERIFY_KEY`**. So it is
+created in two parts, around the Blueprint apply.
+
+**Part A — create the shell (before the Blueprint apply, step 3):**
 
 1. **New → Workflow**, link this repo, same workspace + region.
 2. **Root Directory:** `autogpt_platform/backend`
    **Build Command:** `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`
    **Start Command:** `poetry run python -m backend.workflows.main`
-3. Give it the same DB / Redis / secret wiring as the backend (`DATABASE_URL` +
+3. Create it and **copy its slug** (task id shows as `{slug}/run_graph_execution`). Its
+   first deploy will **fail** — Postgres/Redis/`JWT_VERIFY_KEY` don't exist yet. That's
+   expected; you only need the slug, which you'll paste into the Blueprint prompt (step 4).
+
+**Part B — finish it (after the Blueprint apply, step 7):**
+
+4. Give it the same DB / Redis / secret wiring as the backend (`DATABASE_URL` +
    `DIRECT_URL` with `?schema=platform`, `REDIS_URL` from the Key Value connection string
-   (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
-   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY`, and the **same
-   deployer-generated `ENCRYPTION_KEY` you set on rest-server** (confirm the boot
+   (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`, `EXECUTION_BACKEND=workflows`,
+   `RENDER_API_KEY`, `JWT_VERIFY_KEY` (copy the generated value from rest-server), and the
+   **same deployer-generated `ENCRYPTION_KEY` you set on rest-server** (confirm the boot
    fingerprint matches), plus provider API keys your graphs use).
-4. Deploy it, copy its slug (task id shows as `{slug}/run_graph_execution`).
-5. Set `RENDER_WORKFLOW_SLUG` (+ `RENDER_API_KEY`, `EXECUTION_BACKEND=workflows`) on
-   `rest-server` and `scheduler-server`, then redeploy those two.
+5. Deploy it for real. It should now boot; graph execution works end-to-end.
 
 ### Manual step — LLM / Claude API keys
 
