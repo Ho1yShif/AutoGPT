@@ -458,8 +458,11 @@ projects:
 # Two groups are referenced via `fromGroup` above:
 #   autogpt-platform-secrets        — declared below; Blueprint-managed.
 #   autogpt-platform-deploy-secrets — deployer-made, NOT declared here. Holds
-#     ENCRYPTION_KEY / RENDER_API_KEY / RENDER_WORKFLOW_SLUG; created by hand
-#     before apply so services boot with values present (README). Undeclared
+#     ENCRYPTION_KEY / RENDER_API_KEY / RENDER_WORKFLOW_SLUG plus the LLM keys
+#     (OPEN_ROUTER_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / CHAT_*);
+#     created by hand before apply so services boot with values present
+#     (README). The manual executor Workflow links this same group in the
+#     Dashboard for ENCRYPTION_KEY / RENDER_API_KEY / LLM keys. Undeclared
 #     because sync:false is ignored in declared groups; `render blueprints
 #     validate` and apply both expect it to already exist in the workspace.
 # JWT_VERIFY_KEY stays a rest-server generateValue (fanned out), not in a group.

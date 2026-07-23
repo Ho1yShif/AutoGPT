@@ -192,7 +192,8 @@ Buckets 3 and 4 need your input. The two env groups differ:
 
 ### What fans out and what doesn't
 
-- Set once: the three deploy secrets (via `fromGroup`), plus `JWT_VERIFY_KEY` (`generateValue`
+- Set once: everything in `autogpt-platform-deploy-secrets` — the three deploy secrets and the
+  LLM keys (via `fromGroup`) — plus `JWT_VERIFY_KEY` (`generateValue`
   on rest-server) and `FRONTEND_BASE_URL` (placeholder `value:` on rest-server), which other
   services pull via `fromService`.
 - Per service: the remaining `sync: false` prompts — frontend URL keys and optional GoTrue keys.
@@ -220,22 +221,25 @@ default.
 
 ### Deployer-supplied keys (bucket 3)
 
-The three deployer secrets go in one env group, `autogpt-platform-deploy-secrets`, that you
-create **before applying** the blueprint (all three values are knowable ahead of time). At
-apply, rest-server, database-manager, and scheduler-server link to it via `fromGroup`, so each
-value is entered once. Create the [executor Workflow](#manual-step--the-executor-workflow)
-first — you need its slug for the group.
+All deployer-supplied values go in one env group, `autogpt-platform-deploy-secrets`, that you
+create **before applying** the blueprint — every value is knowable ahead of time once the
+[executor Workflow](#manual-step--the-executor-workflow) exists (create it first — you need its
+slug). At apply, rest-server, database-manager, and scheduler-server link to it via `fromGroup`,
+so each value is entered once.
 
-| Key                    | Consumed by (via `fromGroup`)               | What to enter                                                                                                                                                                       |
+| Key                    | Consumed by                                 | What to enter                                                                                                                                                                       |
 | ---------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ENCRYPTION_KEY`       | rest-server + database-manager (+ Workflow) | Fernet key for stored credentials — generate with `python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"` ([details](#generating-encryption_key)) |
 | `RENDER_API_KEY`       | rest-server + scheduler-server (+ Workflow) | Render workspace API key (Workflows dispatch) — Dashboard → Settings → API Keys                                                                                                     |
 | `RENDER_WORKFLOW_SLUG` | rest-server + scheduler-server              | Executor Workflow slug — create the Workflow first so it's known before apply                                                                                                       |
+| LLM keys               | rest-server + Workflow                      | Copilot chat + AI blocks — pick a transport in [LLM / Claude API keys](#manual-step--llm--claude-api-keys)                                                                          |
 
-The manual Workflow can't join the group (not a blueprint resource) — paste the same
-`ENCRYPTION_KEY` and `RENDER_API_KEY` into it by hand ([Part B](#manual-step--the-executor-workflow)).
-`fromGroup` is all-or-nothing, so database-manager and scheduler-server each get all three keys
-and use the subset they need — one group to manage instead of two.
+The manual Workflow can't use `fromGroup` (it isn't a blueprint resource), but it **can** link
+the group by hand in the Dashboard ([Part B](#manual-step--the-executor-workflow)) — that's how
+it picks up `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the LLM keys without re-entering them, and it
+guarantees its `ENCRYPTION_KEY` fingerprint matches rest-server's. `fromGroup` is all-or-nothing,
+so database-manager and scheduler-server each receive every key in the group and use the subset
+they need (the LLM/slug keys they ignore are harmless) — one group to manage instead of two.
 
 ### Per-service prompts (bucket 4)
 
@@ -366,8 +370,10 @@ Generate one with stdlib:
 python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 ```
 
-Put it in the `autogpt-platform-deploy-secrets` group and paste the same value into the manual
-Workflow. It can't be `generateValue` (may emit chars Fernet rejects).
+Put it in the `autogpt-platform-deploy-secrets` group. Blueprint services pull it via `fromGroup`
+and the Workflow reads the same group by linking it ([Part B](#manual-step--the-executor-workflow)),
+so every consumer gets the identical value — no hand-copying. It can't be `generateValue` (may
+emit chars Fernet rejects).
 
 Each service with the key logs `ENCRYPTION_KEY loaded (fingerprint=<12 hex chars>)` at boot —
 confirm rest-server, database-manager, and the Workflow print the same fingerprint; a mismatch
