@@ -71,9 +71,11 @@ async def dispatch_graph_execution(graph_exec_id: str, user_id: str) -> str:
         return run.id
 
     run_id = await asyncio.to_thread(_start)
+    # The task args are logged in the exact JSON shape the Workflows CLI/dev
+    # server expects, so a local re-invocation can copy them verbatim.
     logger.info(
         f"Dispatched graph execution {graph_exec_id} to Render Workflows "
-        f"run_id={run_id}"
+        f'run_id={run_id}; task args = ["{graph_exec_id}", "{user_id}"]'
     )
     return run_id
 
