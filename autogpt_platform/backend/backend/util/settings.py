@@ -2,7 +2,7 @@ import json
 import os
 import re
 from enum import Enum
-from typing import Any, Dict, Generic, List, Set, Tuple, Type, TypeVar
+from typing import Any, Dict, Generic, List, Literal, Set, Tuple, Type, TypeVar
 
 from pydantic import (
     AliasChoices,
@@ -183,7 +183,36 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         default=25,
         ge=1,
         le=1000,
-        description="Maximum number of concurrent graph executions allowed per user per graph.",
+        description=(
+            "Maximum number of concurrent graph executions allowed per user. "
+            "NOTE: the enforced scope differs by EXECUTION_BACKEND. On 'rabbitmq' "
+            "it is counted per (user_id, graph_id) of RUNNING executions at "
+            "consume time (executor/manager.py); on 'workflows' it is a per-user "
+            "global slot pool enforced at dispatch time "
+            "(workflows/rate_limit.acquire_run_slot). Keep this in mind when "
+            "tuning: the same value is stricter on the workflows path (one pool "
+            "across all graphs) than on the rabbitmq path (one budget per graph)."
+        ),
+    )
+    execution_backend: Literal["rabbitmq", "workflows"] = Field(
+        default="rabbitmq",
+        description=(
+            "Dispatch backend for graph executions. 'rabbitmq' (default) keeps "
+            "the classic broker path (ExecutionManager consuming from RabbitMQ). "
+            "'workflows' dispatches each run to a Render Workflows task via the "
+            "Render SDK (no broker). Selected on the producer side by "
+            "add_graph_execution / stop_graph_execution."
+        ),
+    )
+    render_workflow_slug: str = Field(
+        default="",
+        description=(
+            "Slug of the manually-created Render Workflow service that hosts the "
+            "run_graph_execution task (task id = '{slug}/run_graph_execution'). "
+            "Required when EXECUTION_BACKEND=workflows. Render Blueprints cannot "
+            "declare Workflows, so this is wired as a plain env var after the "
+            "Workflow is created in the Dashboard."
+        ),
     )
     max_inflight_copilot_turns_per_user: int = Field(
         default=15,
@@ -672,6 +701,16 @@ class Secrets(UpdateTrackingModel["Secrets"], BaseSettings):
     rabbitmq_default_user: str = Field(default="", description="RabbitMQ default user")
     rabbitmq_default_pass: str = Field(
         default="", description="RabbitMQ default password"
+    )
+
+    render_api_key: str = Field(
+        default="",
+        description=(
+            "Render API key used by the Render SDK client to start/cancel "
+            "Workflow task runs. Required on producer services (rest, scheduler, "
+            "executor) when EXECUTION_BACKEND=workflows. The SDK reads it from "
+            "the RENDER_API_KEY env var."
+        ),
     )
 
     postmark_server_api_token: str = Field(

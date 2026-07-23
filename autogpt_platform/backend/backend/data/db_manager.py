@@ -75,7 +75,9 @@ from backend.data.execution import (
     get_latest_node_execution,
     get_node_execution,
     get_node_executions,
+    get_render_run_id,
     set_execution_kv_data,
+    set_render_run_id,
     update_graph_execution_start_time,
     update_graph_execution_stats,
     update_node_execution_status,
@@ -277,6 +279,8 @@ class DatabaseManager(AppService):
     update_node_execution_status_batch = _(update_node_execution_status_batch)
     update_graph_execution_start_time = _(update_graph_execution_start_time)
     update_graph_execution_stats = _(update_graph_execution_stats)
+    set_render_run_id = _(set_render_run_id)
+    get_render_run_id = _(get_render_run_id)
     upsert_execution_input = _(upsert_execution_input)
     upsert_execution_output = _(upsert_execution_output)
     get_execution_outputs_by_node_exec_id = _(get_execution_outputs_by_node_exec_id)
@@ -508,6 +512,8 @@ class DatabaseManagerClient(AppServiceClient):
     update_node_execution_status = _(d.update_node_execution_status)
     update_graph_execution_start_time = _(d.update_graph_execution_start_time)
     update_graph_execution_stats = _(d.update_graph_execution_stats)
+    set_render_run_id = _(d.set_render_run_id)
+    get_render_run_id = _(d.get_render_run_id)
     upsert_execution_output = _(d.upsert_execution_output)
 
     # Graphs
@@ -570,6 +576,8 @@ class DatabaseManagerAsyncClient(AppServiceClient):
     get_node_execution = d.get_node_execution
     get_node_executions = d.get_node_executions
     update_graph_execution_stats = d.update_graph_execution_stats
+    set_render_run_id = d.set_render_run_id
+    get_render_run_id = d.get_render_run_id
     update_node_execution_status = d.update_node_execution_status
     update_node_execution_status_batch = d.update_node_execution_status_batch
     upsert_execution_input = d.upsert_execution_input
