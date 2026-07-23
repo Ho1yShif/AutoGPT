@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from functools import cache, wraps
 from typing import Any, Callable, ParamSpec, Protocol, TypeVar, cast, runtime_checkable
 
+from redis import Redis
 from redis.cluster import ClusterNode, RedisCluster
 
 from backend.util.retry import conn_retry
@@ -46,25 +47,70 @@ _HMAC_SIG_LEN = 32
 
 @cache
 @conn_retry("Redis", "Acquiring cache connection")
-def _get_redis() -> RedisCluster:
-    """Lazily-initialized shared-cache Redis Cluster client (singleton)."""
-    # Local import breaks the redis_client <-> cache module cycle.
+def _get_redis() -> RedisCluster | Redis:
+    """Lazily-initialized shared-cache Redis client (singleton).
+
+    Cluster mode (default) builds a ``RedisCluster``; standalone mode
+    (``REDIS_CLUSTER_MODE=false``, e.g. Render Key Value) builds a plain
+    ``Redis`` client against the single node.
+    """
+    # Local import breaks the redis_client <-> cache module cycle. Reuse
+    # redis_client's resolved connection info so the shared cache and the main
+    # client connect identically (same REDIS_URL / TLS / host:port).
+    from backend.data.redis_client import CLUSTER_MODE, PASSWORD, REDIS_URL
+    from backend.data.redis_client import HOST as REDIS_HOST
+    from backend.data.redis_client import PORT as REDIS_PORT
     from backend.data.redis_client import _address_remap
 
-    c = RedisCluster(
-        startup_nodes=[
-            ClusterNode(settings.config.redis_host, settings.config.redis_port)
-        ],
-        password=settings.config.redis_password or None,
+    # `password` is NOT in `common`: passing password=None to `from_url` would
+    # clobber credentials embedded in the URL. It's added per-branch instead
+    # (mirroring redis_client.connect()).
+    common = dict(
         decode_responses=False,  # Binary mode for pickle
         max_connections=50,
         socket_keepalive=True,
         socket_connect_timeout=5,
         retry_on_timeout=True,
-        address_remap=_address_remap,
     )
-    c.ping()
-    return c
+    if not CLUSTER_MODE:
+        if REDIS_URL:
+            # Resolve host/port/password (and rediss:// TLS) from the URL, exactly
+            # like redis_client. The split-var path has no `ssl` knob, so
+            # standalone TLS requires a rediss:// REDIS_URL.
+            client: RedisCluster | Redis = Redis.from_url(REDIS_URL, **common)
+        else:
+            client = Redis(
+                host=REDIS_HOST,
+                port=REDIS_PORT,
+                password=PASSWORD,
+                **common,
+            )
+    else:
+        client = RedisCluster(
+            startup_nodes=[ClusterNode(REDIS_HOST, REDIS_PORT)],
+            password=PASSWORD,
+            address_remap=_address_remap,
+            **common,
+        )
+    client.ping()
+    return client
+
+
+def _scan_cache_keys(match_pattern: str) -> list[bytes]:
+    """SCAN for keys matching ``match_pattern``, fanning out across every
+    primary in cluster mode. In standalone mode a plain ``SCAN`` already
+    walks the single keyspace, so ``target_nodes`` (cluster-only) is dropped.
+    """
+    from backend.data.redis_client import CLUSTER_MODE
+
+    client = _get_redis()
+    if CLUSTER_MODE:
+        return list(
+            cast(RedisCluster, client).scan_iter(
+                match_pattern, target_nodes=RedisCluster.PRIMARIES
+            )
+        )
+    return list(cast(Redis, client).scan_iter(match_pattern))
 
 
 class _MissingType:
@@ -398,17 +444,14 @@ def cached(
             if shared_cache:
                 # SCAN must fan out across every primary on a cluster — without
                 # target_nodes the scan only walks the shard the client is
-                # bound to, leaving stale keys on the other shards.
+                # bound to, leaving stale keys on the other shards. In
+                # standalone mode a single SCAN already covers the keyspace.
                 match_pattern = (
                     f"cache:{func_name}:{pattern}"
                     if pattern
                     else f"cache:{func_name}:*"
                 )
-                keys = list(
-                    _get_redis().scan_iter(
-                        match_pattern, target_nodes=RedisCluster.PRIMARIES
-                    )
-                )
+                keys = _scan_cache_keys(match_pattern)
 
                 if keys:
                     pipeline = _get_redis().pipeline()
@@ -426,12 +469,7 @@ def cached(
 
         def cache_info() -> dict[str, int | None]:
             if shared_cache:
-                cache_keys = list(
-                    _get_redis().scan_iter(
-                        f"cache:{func_name}:*",
-                        target_nodes=RedisCluster.PRIMARIES,
-                    )
-                )
+                cache_keys = _scan_cache_keys(f"cache:{func_name}:*")
                 return {
                     "size": len(cache_keys),
                     "maxsize": None,  # Redis manages its own size
