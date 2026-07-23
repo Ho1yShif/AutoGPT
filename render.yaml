@@ -286,12 +286,19 @@ projects:
               - key: EXECUTION_SCHEDULER_PORT
                 fromService: { name: scheduler-server, type: pserv, property: port }
               # --- Workflows producer (Stream C) --------------------------
+              # RENDER_API_KEY and RENDER_WORKFLOW_SLUG cannot be fanned out to
+              # scheduler-server via `fromService envVarKey` (that reference can't
+              # resolve a sync:false source at apply — it rolls the Blueprint
+              # back), so each is its own sync:false on BOTH rest-server and
+              # scheduler-server: the deployer enters the SAME value at each
+              # prompt. Create the executor Workflow BEFORE applying this Blueprint
+              # (README manual step) so its slug is known at apply.
               - key: EXECUTION_BACKEND
                 value: workflows
               - key: RENDER_API_KEY
-                sync: false
+                sync: false             # DEPLOYER: Render workspace API key (same value on scheduler-server)
               - key: RENDER_WORKFLOW_SLUG
-                sync: false             # set after the Workflow is created, then redeploy
+                sync: false             # DEPLOYER: executor Workflow slug (same value on scheduler-server)
               # --- ClamAV --------------------------------------------------
               - key: CLAMAV_SERVICE_HOST
                 fromService: { name: clamav, type: pserv, property: host }
@@ -317,32 +324,43 @@ projects:
               - key: JWT_SIGN_ALGORITHM
                 value: HS256
               # ENCRYPTION_KEY: Fernet cipher key for stored credentials.
-              # rest-server OWNS it: a single deployer-supplied (sync:false) value.
-              # ws / scheduler / database-manager pull THIS value via
-              # `fromService envVarKey: ENCRYPTION_KEY`, so the deployer enters it
-              # ONCE (no 4x paste, no mismatch risk). NOT generateValue — Render's
-              # generated secret is not guaranteed to be a valid url-safe-base64
-              # Fernet key. NOT in the shared group — sync:false is ignored inside
-              # groups and a literal group value is clobbered on every re-sync
-              # (which would make stored creds undecryptable). The manual executor
-              # Workflow is outside this Blueprint, so it MUST get the same value
-              # pasted by hand. Each service logs a non-secret fingerprint at boot
-              # to spot mismatches. See README.
+              # Deployer-supplied (sync:false). It CANNOT be fanned out via
+              # `fromService envVarKey` — that reference can't resolve a sync:false
+              # source (it has no value at apply and would roll the Blueprint
+              # back), and it can't be generateValue (Render's secret is not a
+              # valid url-safe-base64 Fernet key ~74% of the time) or a literal
+              # value (would ship a public, known key). So it is declared as its
+              # own sync:false ONLY on the services that actually decrypt stored
+              # credentials — rest-server and database-manager (the data/creds
+              # layer). ws (Redis fan-out) and scheduler (RPC via database-manager)
+              # do not instantiate the cryptor, so they omit it (guarded by
+              # `if ENCRYPTION_KEY:` — empty is tolerated). The deployer pastes the
+              # SAME key on rest-server + database-manager + the manual executor
+              # Workflow (outside this Blueprint). Each service logs a non-secret
+              # fingerprint at boot to spot mismatches. See README + invariant #5.
               - key: ENCRYPTION_KEY
-                sync: false
+                sync: false             # DEPLOYER: Fernet key (same value on database-manager + Workflow)
               # --- URLs / CORS / env --------------------------------------
               - key: APP_ENV
                 value: prod
-              # THE single backend URL keyname. Enter the frontend's public
-              # origin (e.g. https://<frontend>.onrender.com) ONCE, here. On the
-              # first apply enter a valid https placeholder (e.g.
-              # https://example.com — an empty/invalid value fails CORS
-              # validation at boot), then set the real origin and redeploy.
+              # THE single backend URL keyname — rest-server OWNS it; gotrue /
+              # ws / scheduler / database-manager pull THIS value via
+              # `fromService envVarKey: FRONTEND_BASE_URL`. It is a literal
+              # placeholder `value:` (NOT sync:false) on purpose: the frontend's
+              # public onrender.com URL is unknowable at apply time AND cannot be
+              # injected across services (fromService shares only INTERNAL hosts;
+              # RENDER_EXTERNAL_URL is runtime-only and not copyable). A
+              # `fromService envVarKey` reference can only resolve a source that
+              # holds a concrete value in the Blueprint (value: / generateValue) —
+              # a sync:false source resolves to "environment variable not found"
+              # at apply and rolls the whole Blueprint back. So we ship a valid
+              # https placeholder (passes the CORS/URL validator at boot) and the
+              # deployer sets the REAL frontend origin here ONCE after the first
+              # deploy, then redeploys — the fan-out carries it everywhere.
               # PLATFORM_BASE_URL and BACKEND_CORS_ALLOW_ORIGINS are DERIVED from
-              # this + RENDER_EXTERNAL_URL in the dockerCommand above; ws /
-              # scheduler / database-manager pull this value via fromService.
+              # this + RENDER_EXTERNAL_URL in the dockerCommand above. See README.
               - key: FRONTEND_BASE_URL
-                sync: false             # DEPLOYER: frontend public origin (the one backend keyname)
+                value: https://REPLACE-WITH-FRONTEND-URL.onrender.com
               # --- Shared secrets group (UNSUBSCRIBE_SECRET_KEY) ----------
               - fromGroup: autogpt-platform-secrets
 
@@ -401,10 +419,8 @@ projects:
               # owner); dockerCommand derives BACKEND_CORS_ALLOW_ORIGINS from it.
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              # Pull rest-server's single deployer-supplied ENCRYPTION_KEY (owner)
-              # so the Fernet key is guaranteed identical without a second paste.
-              - key: ENCRYPTION_KEY
-                fromService: { name: rest-server, type: web, envVarKey: ENCRYPTION_KEY }
+              # No ENCRYPTION_KEY: the WSS fan-out service never decrypts stored
+              # credentials (see rest-server's ENCRYPTION_KEY note + invariant #5).
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -458,10 +474,18 @@ projects:
                 value: "false"
               - key: EXECUTION_BACKEND
                 value: workflows
+              # Deployer-supplied. These CANNOT be pulled from rest-server via
+              # `fromService envVarKey` — that reference can't resolve a sync:false
+              # source at apply (it errors "environment variable not found" and
+              # rolls the Blueprint back). RENDER_API_KEY is a secret and
+              # RENDER_WORKFLOW_SLUG is deployer-known at apply time (the executor
+              # Workflow is created BEFORE the Blueprint — see README), so both are
+              # their own sync:false here: the deployer enters the SAME two values
+              # on rest-server and scheduler-server at the apply prompt.
               - key: RENDER_API_KEY
-                sync: false
+                sync: false             # DEPLOYER: Render workspace API key (same as rest-server)
               - key: RENDER_WORKFLOW_SLUG
-                sync: false             # same value as rest-server (post-Workflow)
+                sync: false             # DEPLOYER: executor Workflow slug (same as rest-server)
               # HS256 secret — config hard-fails on an empty JWT_VERIFY_KEY, so
               # pull rest-server's service-level generateValue (owner).
               - key: JWT_VERIFY_KEY
@@ -472,10 +496,9 @@ projects:
               # keyname from rest-server (the owner).
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              # Pull rest-server's single deployer-supplied ENCRYPTION_KEY (owner)
-              # so the Fernet key is guaranteed identical without a second paste.
-              - key: ENCRYPTION_KEY
-                fromService: { name: rest-server, type: web, envVarKey: ENCRYPTION_KEY }
+              # No ENCRYPTION_KEY: the scheduler routes all app DB access through
+              # database-manager and never decrypts stored credentials itself
+              # (see rest-server's ENCRYPTION_KEY note + invariant #5).
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -530,10 +553,14 @@ projects:
               # single keyname from rest-server (the owner).
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              # Pull rest-server's single deployer-supplied ENCRYPTION_KEY (owner)
-              # so the Fernet key is guaranteed identical without a second paste.
+              # ENCRYPTION_KEY: database-manager IS a creds-decrypting service, so
+              # it needs the Fernet key. It CANNOT pull it from rest-server via
+              # fromService (a sync:false source doesn't resolve at apply), so it
+              # is its own sync:false — the deployer pastes the SAME key here as on
+              # rest-server (and the manual Workflow). Boot logs a fingerprint to
+              # catch mismatches. See rest-server's ENCRYPTION_KEY note.
               - key: ENCRYPTION_KEY
-                fromService: { name: rest-server, type: web, envVarKey: ENCRYPTION_KEY }
+                sync: false             # DEPLOYER: Fernet key (same value on rest-server + Workflow)
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
