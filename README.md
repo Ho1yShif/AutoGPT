@@ -74,7 +74,7 @@ steps; the tables there are the source of truth.
 
 > **The two things to prepare first:** the [executor Workflow](#manual-step--the-executor-workflow)
 > (created by hand — the Blueprint needs its slug) and the
-> [`autogpt-platform-deploy-secrets` env group](#deployer-supplied-keys-bucket-3) (created before
+> [`autogpt-platform-byo-secrets` env group](#deployer-supplied-keys-bucket-3) (created before
 > you apply). Because you make the Workflow first, its slug is known up front, so every value you
 > supply — deploy secrets **and** LLM keys — goes into that one group. Everything else is entered
 > in the Blueprint prompts or after the first apply.
@@ -82,14 +82,14 @@ steps; the tables there are the source of truth.
 1. Fork this repo and push it to your GitHub/GitLab account.
 2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
    its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
-3. Create the `autogpt-platform-deploy-secrets` env group (Dashboard → Env Groups → New) with
+3. Create the `autogpt-platform-byo-secrets` env group (Dashboard → Env Groups → New) with
    `ENCRYPTION_KEY`, `RENDER_API_KEY`, the slug from step 2, and your LLM key(s). See
    [Deployer-supplied keys](#deployer-supplied-keys-bucket-3) and
    [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
 4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
    `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs and the anon key.
    (No SMTP needed — signups self-confirm by default.)
-5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
+5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-managed-secrets` group
    and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
 
    > **First-deploy ordering.** Render brings all services up in parallel and does not order
@@ -105,7 +105,7 @@ steps; the tables there are the source of truth.
    [per-service prompts](#per-service-prompts-bucket-4).
 7. Finish the executor Workflow ([part B](#manual-step--the-executor-workflow)): now that
    Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env, link the
-   `autogpt-platform-deploy-secrets` group (it picks up `ENCRYPTION_KEY`, `RENDER_API_KEY`, and
+   `autogpt-platform-byo-secrets` group (it picks up `ENCRYPTION_KEY`, `RENDER_API_KEY`, and
    the LLM keys in one link), and deploy for real.
 
 Optional, after the app is up: [require email verification](#require-email-verification) (SMTP)
@@ -132,7 +132,7 @@ Part B — finish it (after the apply, step 7):
 4. Give it the same wiring as the backend: `DATABASE_URL` + `DIRECT_URL` with
    `?schema=platform`, `REDIS_URL` (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
    `EXECUTION_BACKEND=workflows`, and `JWT_VERIFY_KEY` (copy from rest-server).
-5. Link the `autogpt-platform-deploy-secrets` group (Environment → Link Environment Group). That
+5. Link the `autogpt-platform-byo-secrets` group (Environment → Link Environment Group). That
    hands the Workflow `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the LLM keys in one link — the same
    group values rest-server uses, so the boot fingerprints match by construction (no hand-paste).
 6. Deploy for real. It should boot; graph execution works end-to-end.
@@ -144,20 +144,16 @@ blocks (AI Text Generator, `claude_code`, `orchestrator`, on the executor Workfl
 deploy succeeds with no key set — these features just return nothing until one is present.
 
 These keys aren't in `render.yaml` (`sync: false` is invalid in a declared group, and the
-Workflow isn't a Blueprint resource). They go in the same `autogpt-platform-deploy-secrets` group
+Workflow isn't a Blueprint resource). They go in the same `autogpt-platform-byo-secrets` group
 as the deploy secrets — one deployer-made group read by both consumers:
 
-1. Add the keys to the `autogpt-platform-deploy-secrets` group (the one you create in
+1. Add the keys to the `autogpt-platform-byo-secrets` group (the one you create in
    [step 3](#deploy) with the deploy secrets — don't add it to `render.yaml`). Pick one transport:
-
-   | Transport                         | Env to set                                                                                     | Render?                          |
-   | --------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------- |
-   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`)                         | ✅                               |
-   | Direct Anthropic                  | `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅                               |
-   | Subscription (`claude login`)     | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true`                                                       | ⚠️ advanced/dev only (see Notes) |
-
-   Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
-   fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
+   - **OpenRouter** (default, recommended) — set `OPEN_ROUTER_API_KEY=<key>`; leave `CHAT_USE_OPENROUTER` unset or `true`. ✅ Works on Render.
+   - **Direct Anthropic** — set `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false` (or use `CHAT_DIRECT_ANTHROPIC_API_KEY`). ✅ Works on Render.
+   - **Subscription** (`claude login`) — set `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true`. ⚠️ Advanced/dev only (see [Notes](#notes--tradeoffs)).
+   - **OPENAI** - Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
+     fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
 
 2. Both consumers already read the group: rest-server (copilot chat) links it via `fromGroup` in
    `render.yaml`, and you link it to the executor Workflow (AI blocks) by hand in
@@ -176,15 +172,15 @@ lives, and when you set it. Every environment value falls into one of four bucke
 | #   | Bucket                                           | Where                   | Who sets it                | When                                 |
 | --- | ------------------------------------------------ | ----------------------- | -------------------------- | ------------------------------------ |
 | 1   | Automatic wires (`fromDatabase` / `fromService`) | each service            | Render, from `render.yaml` | at apply — nothing to do             |
-| 2   | Env group `autogpt-platform-secrets`             | Blueprint-managed group | Render (`generateValue`)   | at apply — never touched             |
-| 3   | Env group `autogpt-platform-deploy-secrets`      | group you create        | you, in the Dashboard      | **before apply**, after the Workflow |
+| 2   | Env group `autogpt-platform-managed-secrets`     | Blueprint-managed group | Render (`generateValue`)   | at apply — never touched             |
+| 3   | Env group `autogpt-platform-byo-secrets`         | group you create        | you, in the Dashboard      | **before apply**, after the Workflow |
 | 4   | Per-service prompts (`sync: false`)              | each service            | you, in the Dashboard      | some at apply, some after URLs exist |
 
 Buckets 3 and 4 need your input. The two env groups differ:
 
-- `autogpt-platform-secrets` — declared in `render.yaml`, auto-created, holds only
+- `autogpt-platform-managed-secrets` — declared in `render.yaml`, auto-created, holds only
   `UNSUBSCRIBE_SECRET_KEY`. You never touch it.
-- `autogpt-platform-deploy-secrets` — you create it before applying with the deploy secrets
+- `autogpt-platform-byo-secrets` — you create it before applying with the deploy secrets
   (`ENCRYPTION_KEY`, `RENDER_API_KEY`, `RENDER_WORKFLOW_SLUG`) **and** the
   [LLM keys](#manual-step--llm--claude-api-keys); rest-server, database-manager, and
   scheduler-server link it via `fromGroup`, and you link it to the executor Workflow by hand, so
@@ -192,7 +188,7 @@ Buckets 3 and 4 need your input. The two env groups differ:
 
 ### What fans out and what doesn't
 
-- Set once: everything in `autogpt-platform-deploy-secrets` — the three deploy secrets and the
+- Set once: everything in `autogpt-platform-byo-secrets` — the three deploy secrets and the
   LLM keys (via `fromGroup`) — plus `JWT_VERIFY_KEY` (`generateValue`
   on rest-server) and `FRONTEND_BASE_URL` (placeholder `value:` on rest-server), which other
   services pull via `fromService`.
@@ -221,7 +217,7 @@ default.
 
 ### Deployer-supplied keys (bucket 3)
 
-All deployer-supplied values go in one env group, `autogpt-platform-deploy-secrets`, that you
+All deployer-supplied values go in one env group, `autogpt-platform-byo-secrets`, that you
 create **before applying** the blueprint — every value is knowable ahead of time once the
 [executor Workflow](#manual-step--the-executor-workflow) exists (create it first — you need its
 slug). At apply, rest-server, database-manager, and scheduler-server link to it via `fromGroup`,
@@ -363,7 +359,7 @@ Generate one with stdlib:
 python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 ```
 
-Put it in the `autogpt-platform-deploy-secrets` group. Blueprint services pull it via `fromGroup`
+Put it in the `autogpt-platform-byo-secrets` group. Blueprint services pull it via `fromGroup`
 and the Workflow reads the same group by linking it ([Part B](#manual-step--the-executor-workflow)),
 so every consumer gets the identical value — no hand-copying. It can't be `generateValue` (may
 emit chars Fernet rejects).
