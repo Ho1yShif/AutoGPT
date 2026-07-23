@@ -101,7 +101,12 @@ projects:
               - key: GOTRUE_API_PORT
                 value: "10000"           # == Render default PORT (rewrite target)
               # FRONTEND_BASE_URL pulled from rest-server (the owner) — no re-prompt.
-              - key: GOTRUE_API_EXTERNAL_URL
+              # NOTE: this key is UNPREFIXED (API_EXTERNAL_URL, not
+              # GOTRUE_API_EXTERNAL_URL). GoTrue reads it via an explicit
+              # envconfig:"API_EXTERNAL_URL" tag that overrides the GOTRUE_
+              # prefix; the prefixed form is silently ignored and boot fails
+              # with `required key API_EXTERNAL_URL missing value`.
+              - key: API_EXTERNAL_URL
                 fromService:
                   name: rest-server
                   type: web
