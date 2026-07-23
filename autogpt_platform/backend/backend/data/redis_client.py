@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from typing import TypeAlias, cast
 
 from dotenv import load_dotenv
 from redis import Redis
@@ -21,11 +22,25 @@ from backend.util.retry import conn_retry
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var consistently ("1"/"true"/"yes"/"on" → True)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # Prefer the cluster env vars so the cluster-only image can co-exist with
 # old-image pods still reading REDIS_HOST during a rollout.
 HOST = os.getenv("REDIS_CLUSTER_HOST") or os.getenv("REDIS_HOST", "localhost")
 PORT = int(os.getenv("REDIS_CLUSTER_PORT") or os.getenv("REDIS_PORT", "6379"))
 PASSWORD = os.getenv("REDIS_PASSWORD", None)
+# Full connection URL (e.g. Render Key Value's connectionString). When set, the
+# standalone client connects via this instead of the split HOST/PORT/PASSWORD —
+# so credentials embedded in the URL (internal auth enabled) are honored without
+# a separate password var. Ignored in cluster mode.
+REDIS_URL = os.getenv("REDIS_URL") or None
 
 # Fail-fast on a wedged endpoint instead of blocking on no-response TCP.
 SOCKET_TIMEOUT = float(os.getenv("REDIS_SOCKET_TIMEOUT", "30"))
@@ -36,11 +51,13 @@ HEALTH_CHECK_INTERVAL = int(os.getenv("REDIS_HEALTH_CHECK_INTERVAL", "30"))
 
 # Skip the HOST-pinning remap when each shard's announced hostname resolves
 # directly (e.g. compose DNS names redis-0/redis-1/redis-2).
-USE_ANNOUNCED_ADDRESS = os.getenv("REDIS_USE_ANNOUNCED_ADDRESS", "").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+USE_ANNOUNCED_ADDRESS = _env_bool("REDIS_USE_ANNOUNCED_ADDRESS", False)
+
+# Standalone (non-cluster) mode: connect to a single Redis/Key Value node with a
+# plain client and skip all cluster-only keyslot routing. Render's managed Key
+# Value sets REDIS_CLUSTER_MODE=false; the default (true) keeps the existing
+# sharded-cluster path fully intact.
+CLUSTER_MODE = _env_bool("REDIS_CLUSTER_MODE", True)
 
 # Retry transient cluster errors internally so a rotation blip never surfaces
 # as a graph-exec 500.
@@ -55,9 +72,11 @@ TRANSIENT_REDIS_ERRORS: tuple[type[RedisError], ...] = (
 
 logger = logging.getLogger(__name__)
 
-# Aliases so call-sites don't care which class this is.
-RedisClient = RedisCluster
-AsyncRedisClient = AsyncRedisCluster
+# Aliases so call-sites don't care which class this is. In standalone mode
+# ``connect()`` returns a plain ``Redis``; the union keeps annotations honest
+# without forcing every call-site to branch on the mode.
+RedisClient: TypeAlias = RedisCluster | Redis
+AsyncRedisClient: TypeAlias = AsyncRedisCluster | AsyncRedis
 
 
 def _build_retry() -> Retry:
@@ -93,18 +112,30 @@ def _address_remap(addr: tuple[str, int]) -> tuple[str, int]:
 
 @conn_retry("Redis", "Acquiring connection")
 def connect() -> RedisClient:
-    c = RedisCluster(
-        startup_nodes=[ClusterNode(HOST, PORT)],
-        password=PASSWORD,
+    # Shared across the standalone and cluster branches; only host/port (vs
+    # startup_nodes + address_remap) and the connection-URL preference differ.
+    common = dict(
         decode_responses=True,
         socket_timeout=SOCKET_TIMEOUT,
         socket_connect_timeout=SOCKET_CONNECT_TIMEOUT,
         socket_keepalive=True,
         health_check_interval=HEALTH_CHECK_INTERVAL,
-        address_remap=_address_remap,
         # Drives both per-command retries and the cluster-level retry counter.
         retry=_build_retry(),
     )
+    if not CLUSTER_MODE:
+        if REDIS_URL:
+            # from_url takes host/port/password from the URL itself.
+            c: RedisClient = Redis.from_url(REDIS_URL, **common)
+        else:
+            c = Redis(host=HOST, port=PORT, password=PASSWORD, **common)
+    else:
+        c = RedisCluster(
+            startup_nodes=[ClusterNode(HOST, PORT)],
+            password=PASSWORD,
+            address_remap=_address_remap,
+            **common,
+        )
     # Close on PING failure so retries don't leak ClusterNodes (AUTOGPT-SERVER-8T1).
     try:
         c.ping()
@@ -130,20 +161,32 @@ def get_redis() -> RedisClient:
 
 @conn_retry("AsyncRedis", "Acquiring connection")
 async def connect_async() -> AsyncRedisClient:
-    c = AsyncRedisCluster(
-        startup_nodes=[AsyncClusterNode(HOST, PORT)],
-        password=PASSWORD,
+    # Shared across both branches (see the sync `connect` for the rationale).
+    # redis-py ships separate sync/async Retry classes, so this uses the async one.
+    common = dict(
         decode_responses=True,
         socket_timeout=SOCKET_TIMEOUT,
         socket_connect_timeout=SOCKET_CONNECT_TIMEOUT,
         socket_keepalive=True,
         health_check_interval=HEALTH_CHECK_INTERVAL,
-        address_remap=_address_remap,
         # redis-py 6.x AsyncRedisCluster ignores `retry_on_error` — the cluster
         # retry path uses a hardcoded {Timeout, Connection, ClusterDown} set.
         # Pass `retry` only to match the sync RedisCluster call above.
         retry=_build_async_retry(),
     )
+    if not CLUSTER_MODE:
+        if REDIS_URL:
+            # from_url takes host/port/password from the URL itself.
+            c: AsyncRedisClient = AsyncRedis.from_url(REDIS_URL, **common)
+        else:
+            c = AsyncRedis(host=HOST, port=PORT, password=PASSWORD, **common)
+    else:
+        c = AsyncRedisCluster(
+            startup_nodes=[AsyncClusterNode(HOST, PORT)],
+            password=PASSWORD,
+            address_remap=_address_remap,
+            **common,
+        )
     # Close on PING failure so retries don't leak ClusterNodes (AUTOGPT-SERVER-8V6/8V4/8V3).
     try:
         await c.ping()
@@ -158,7 +201,7 @@ async def connect_async() -> AsyncRedisClient:
 
 # One AsyncRedisCluster per event loop: the client binds to the loop it was
 # first awaited on, so a module-level singleton breaks across test loops.
-_async_clients: dict[int, AsyncRedisCluster] = {}
+_async_clients: dict[int, AsyncRedisClient] = {}
 
 
 @conn_retry("AsyncRedis", "Releasing connection")
@@ -187,8 +230,13 @@ def resolve_shard_for_channel(channel: str) -> tuple[str, int]:
 
     Applies the configured ``_address_remap`` so callers connect through the
     same address the cluster client uses.
+
+    In standalone mode there is a single node that owns every keyslot, so the
+    lookup is skipped and ``(HOST, PORT)`` is returned directly.
     """
-    cluster = get_redis()
+    if not CLUSTER_MODE:
+        return HOST, PORT
+    cluster = cast(RedisCluster, get_redis())
     node = cluster.get_node_from_key(channel)
     if node is None:
         raise RuntimeError(f"No cluster node owns the keyslot for channel {channel!r}")
