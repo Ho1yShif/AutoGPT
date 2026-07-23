@@ -4,10 +4,50 @@ import { withSentryConfig } from "@sentry/nextjs";
 // Defaults to true so Vercel/local builds are unaffected.
 const enableSourceMaps = process.env.NEXT_PUBLIC_SOURCEMAPS !== "false";
 
+// --- Render deploy wiring -------------------------------------------------
+// On Render, supabase-js talks to self-hosted GoTrue via a same-origin
+// `/auth/v1/*` path (NEXT_PUBLIC_SUPABASE_URL = this frontend's own origin).
+// We proxy that prefix to GoTrue over the private network. GOTRUE_INTERNAL_URL
+// is wired from the gotrue pserv (`host:port`, e.g. autogpt-platform-gotrue:10000)
+// and has no scheme, so prepend http:// for the internal (non-TLS) hop.
+const gotrueInternalUrl = process.env.GOTRUE_INTERNAL_URL
+  ? process.env.GOTRUE_INTERNAL_URL.startsWith("http")
+    ? process.env.GOTRUE_INTERNAL_URL
+    : `http://${process.env.GOTRUE_INTERNAL_URL}`
+  : null;
+
+// This deployment's own public origin (e.g. https://autogpt-frontend.onrender.com
+// or a custom domain). Used to add the Render domain to next/image allow-lists
+// and to scope font CORS to this origin.
+const frontendOrigin = (() => {
+  const raw = process.env.NEXT_PUBLIC_FRONTEND_BASE_URL;
+  if (!raw) return null;
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return null;
+  }
+})();
+const frontendHostname = frontendOrigin
+  ? new URL(frontendOrigin).hostname
+  : null;
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   // Suppress the "X-Powered-By: Next.js" header (framework fingerprinting).
   poweredByHeader: false,
+  // Strip the supabase-js-hardcoded `/auth/v1` prefix and proxy to GoTrue over
+  // the private network (Render deploy). No-op when GOTRUE_INTERNAL_URL is
+  // unset (local dev / Vercel talk to Supabase/Kong directly).
+  async rewrites() {
+    if (!gotrueInternalUrl) return [];
+    return [
+      {
+        source: "/auth/v1/:path*",
+        destination: `${gotrueInternalUrl}/:path*`,
+      },
+    ];
+  },
   productionBrowserSourceMaps: enableSourceMaps,
   // Externalize OpenTelemetry packages to fix Turbopack HMR issues
   serverExternalPackages: [
@@ -17,10 +57,16 @@ const nextConfig = {
     "require-in-the-middle",
   ],
   experimental: {
+    // Body-size ceiling for Server Actions / middleware routes. Kept modest to
+    // limit the memory-exhaustion (DoS) surface on a public deploy — a 256 MB
+    // cap on every route lets an unauthenticated caller pin server memory.
+    // 50 MB matches the ClamAV StreamMaxLength (see render.yaml) — the effective
+    // upload-scan ceiling — so uploads that would pass scanning still fit. If a
+    // deploy needs larger uploads, raise this AND the ClamAV limits together.
     serverActions: {
-      bodySizeLimit: "256mb",
+      bodySizeLimit: "50mb",
     },
-    middlewareClientMaxBodySize: "256mb",
+    middlewareClientMaxBodySize: "50mb",
     // Limit parallel webpack workers to reduce peak memory during builds.
     cpus: 2,
   },
@@ -53,18 +99,18 @@ const nextConfig = {
     return config;
   },
   images: {
-    domains: [
-      // We dont need to maintain alphabetical order here
-      // as we are doing logical grouping of domains
-      "images.unsplash.com",
-      "ddz4ak4pa3d19.cloudfront.net",
-      "upload.wikimedia.org",
-      "storage.googleapis.com",
-
-      "ideogram.ai", // for generated images
-      "example.com", // for local test data images
-    ],
+    // `domains` is deprecated in Next.js — every allowed host is expressed as a
+    // `remotePatterns` entry instead. Test-only hosts (example.com) are dropped
+    // so they don't ship in a production config.
     remotePatterns: [
+      { protocol: "https", hostname: "images.unsplash.com", pathname: "/**" },
+      {
+        protocol: "https",
+        hostname: "ddz4ak4pa3d19.cloudfront.net",
+        pathname: "/**",
+      },
+      { protocol: "https", hostname: "upload.wikimedia.org", pathname: "/**" },
+      { protocol: "https", hostname: "ideogram.ai", pathname: "/**" },
       {
         protocol: "https",
         hostname: "storage.googleapis.com",
@@ -80,6 +126,11 @@ const nextConfig = {
         hostname: "lh3.googleusercontent.com",
         pathname: "/**",
       },
+      // This deployment's own public domain (Render / custom domain), so
+      // next/image can optimize media served from our own origin.
+      ...(frontendHostname
+        ? [{ protocol: "https", hostname: frontendHostname, pathname: "/**" }]
+        : []),
     ],
   },
   // Vercel has its own deployment mechanism and doesn't need standalone mode
@@ -98,6 +149,12 @@ const nextConfig = {
         headers: [
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "SAMEORIGIN" },
+          // Force HTTPS for a year on this host + subdomains (Render terminates
+          // TLS). Not preloaded — leave that opt-in to the deployer's domain.
+          {
+            key: "Strict-Transport-Security",
+            value: "max-age=31536000; includeSubDomains",
+          },
           // Enables Sentry browser JS self-profiling.
           { key: "Document-Policy", value: "js-profiling" },
         ],
@@ -134,6 +191,19 @@ const nextConfig = {
           },
         ],
       },
+      // This deployment's own public origin (Render / custom domain), so
+      // self-hosted fonts load without an "overly permissive CORS" finding.
+      ...(frontendOrigin
+        ? [
+            {
+              source: "/_next/static/media/:path*",
+              has: [{ type: "header", key: "Origin", value: frontendOrigin }],
+              headers: [
+                { key: "Access-Control-Allow-Origin", value: frontendOrigin },
+              ],
+            },
+          ]
+        : []),
     ];
   },
 };
