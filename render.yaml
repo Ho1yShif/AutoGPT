@@ -198,7 +198,7 @@ projects:
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
               export PLATFORM_BASE_URL="${PLATFORM_BASE_URL:-$RENDER_EXTERNAL_URL}";
               export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
-              exec env AGENT_API_PORT=$PORT rest'
+              exec env AGENT_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/rest'
             healthCheckPath: /health
             # Prisma resolves both url=DATABASE_URL and directUrl=DIRECT_URL at
             # schema load, so both must be exported here too (else first deploy
@@ -206,7 +206,7 @@ projects:
             preDeployCommand: >-
               /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              prisma migrate deploy'
+              /app/autogpt_platform/backend/.venv/bin/prisma migrate deploy'
             envVars:
               # Postgres
               - key: RENDER_DATABASE_URL
@@ -233,18 +233,11 @@ projects:
                 fromService: { name: scheduler-server, type: pserv, property: host }
               - key: EXECUTION_SCHEDULER_PORT
                 fromService: { name: scheduler-server, type: pserv, property: port }
-              # Workflows producer. RENDER_API_KEY / RENDER_WORKFLOW_SLUG can't
-              # be fanned out via `fromService envVarKey` (that can't resolve a
-              # sync:false source at apply — rolls the Blueprint back), so each
-              # is its own sync:false here AND on scheduler-server: the deployer
-              # enters the SAME value at each prompt. Create the executor
-              # Workflow BEFORE applying (README) so its slug is known at apply.
+              # Workflows producer. EXECUTION_BACKEND selects the Workflows
+              # path; RENDER_API_KEY + RENDER_WORKFLOW_SLUG are supplied by the
+              # deployer-made env group (fromGroup below), created before apply.
               - key: EXECUTION_BACKEND
                 value: workflows
-              - key: RENDER_API_KEY
-                sync: false             # DEPLOYER: Render workspace API key (same value on scheduler-server)
-              - key: RENDER_WORKFLOW_SLUG
-                sync: false             # DEPLOYER: executor Workflow slug (same value on scheduler-server)
               # ClamAV
               - key: CLAMAV_SERVICE_HOST
                 fromService: { name: clamav, type: pserv, property: host }
@@ -265,15 +258,10 @@ projects:
                 generateValue: true
               - key: JWT_SIGN_ALGORITHM
                 value: HS256
-              # ENCRYPTION_KEY — Fernet key for stored credentials. Its own
-              # sync:false ONLY on the creds-decrypting services (rest-server +
-              # database-manager). Can't be fanned out (sync:false won't resolve
-              # at apply), generateValue (not valid Fernet ~74% of the time), or
-              # a literal (would ship a public key). Deployer pastes the SAME key
-              # on rest-server + database-manager + the manual Workflow; each
-              # logs a fingerprint at boot. See README + invariant #5.
-              - key: ENCRYPTION_KEY
-                sync: false             # DEPLOYER: Fernet key (same value on database-manager + Workflow)
+              # ENCRYPTION_KEY (Fernet key for stored credentials) now comes
+              # from the deployer-made env group (fromGroup below) — see README +
+              # invariant #5. The manual Workflow, not a Blueprint resource, gets
+              # the same key by hand; each service logs a fingerprint at boot.
               # URLs / CORS / env
               - key: APP_ENV
                 value: prod
@@ -288,8 +276,11 @@ projects:
               # fan-out carries it everywhere. See README.
               - key: FRONTEND_BASE_URL
                 value: https://REPLACE-WITH-FRONTEND-URL.onrender.com
-              # Shared secrets group (UNSUBSCRIBE_SECRET_KEY)
+              # Blueprint-generated secrets group (UNSUBSCRIBE_SECRET_KEY)
               - fromGroup: autogpt-platform-secrets
+              # Deployer-made group, created BEFORE apply: ENCRYPTION_KEY,
+              # RENDER_API_KEY, RENDER_WORKFLOW_SLUG. See README.
+              - fromGroup: autogpt-platform-deploy-secrets
 
           # websocket-server — public web service (WSS). Redis pub/sub fan-out.
           - type: web
@@ -305,7 +296,7 @@ projects:
               /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
               export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
-              exec env WEBSOCKET_SERVER_PORT=$PORT ws'
+              exec env WEBSOCKET_SERVER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/ws'
             healthCheckPath: /health
             envVars:
               - key: RENDER_DATABASE_URL
@@ -355,7 +346,7 @@ projects:
             dockerCommand: >-
               /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              exec env EXECUTION_SCHEDULER_PORT=$PORT scheduler'
+              exec env EXECUTION_SCHEDULER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/scheduler'
             # NOTE: pserv can't declare healthCheckPath in a Blueprint. Serves
             # /health_check on its RPC port; set it in the Dashboard if desired.
             envVars:
@@ -384,12 +375,8 @@ projects:
                 value: "false"
               - key: EXECUTION_BACKEND
                 value: workflows
-              # Own sync:false (can't pull sync:false from rest-server at apply).
-              # Deployer enters the SAME two values as on rest-server.
-              - key: RENDER_API_KEY
-                sync: false             # DEPLOYER: Render workspace API key (same as rest-server)
-              - key: RENDER_WORKFLOW_SLUG
-                sync: false             # DEPLOYER: executor Workflow slug (same as rest-server)
+              # RENDER_API_KEY + RENDER_WORKFLOW_SLUG come from the deployer-made
+              # env group (fromGroup below).
               # HS256 secret — pull rest-server's generateValue (owner).
               - key: JWT_VERIFY_KEY
                 fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
@@ -397,9 +384,10 @@ projects:
                 value: prod
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              # No ENCRYPTION_KEY: routes DB access through database-manager and
-              # never decrypts creds itself (inv #5).
               - fromGroup: autogpt-platform-secrets
+              # Deployer-made group — needs RENDER_API_KEY + RENDER_WORKFLOW_SLUG
+              # (also carries ENCRYPTION_KEY, unused here; combined-group tradeoff).
+              - fromGroup: autogpt-platform-deploy-secrets
 
           # database-manager — private. Centralized Prisma pool over RPC
           # (dockerCommand `db`). Required by scheduler-server (decision #4).
@@ -415,7 +403,7 @@ projects:
             dockerCommand: >-
               /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              exec env DATABASE_API_PORT=$PORT db'
+              exec env DATABASE_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/db'
             # NOTE: pserv can't declare healthCheckPath in a Blueprint.
             envVars:
               - key: PYRO_HOST
@@ -444,12 +432,11 @@ projects:
                 value: prod
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
-              # ENCRYPTION_KEY: database-manager DOES decrypt creds. Own
-              # sync:false (can't pull sync:false at apply) — deployer pastes the
-              # SAME key as on rest-server + the manual Workflow. See rest-server.
-              - key: ENCRYPTION_KEY
-                sync: false             # DEPLOYER: Fernet key (same value on rest-server + Workflow)
               - fromGroup: autogpt-platform-secrets
+              # Deployer-made group — needs ENCRYPTION_KEY (database-manager
+              # decrypts creds; same key as rest-server + the manual Workflow).
+              # Also carries RENDER_API_KEY + RENDER_WORKFLOW_SLUG, unused here.
+              - fromGroup: autogpt-platform-deploy-secrets
 
           # frontend — Next.js public web service (Node). NEXT_PUBLIC_* are
           # inlined at BUILD time → must be PUBLIC URLs, set before first build.
@@ -497,11 +484,14 @@ projects:
                   property: hostport    # -> autogpt-platform-gotrue:10000
 
 # ==========================================================================
-# Shared secrets — workspace env group referenced via `fromGroup`.
-# generateValue persists across syncs; sync:false is IGNORED inside groups, so
-# every Dashboard-prompt secret lives on its service (above), NOT here.
-# JWT_VERIFY_KEY and ENCRYPTION_KEY are deliberately NOT in this group — see the
-# rest-server notes above (they're a service-level generateValue / sync:false).
+# Two groups are referenced via `fromGroup` above:
+#   autogpt-platform-secrets        — declared below; Blueprint-managed.
+#   autogpt-platform-deploy-secrets — deployer-made, NOT declared here. Holds
+#     ENCRYPTION_KEY / RENDER_API_KEY / RENDER_WORKFLOW_SLUG; created by hand
+#     before apply so services boot with values present (README). Undeclared
+#     because sync:false is ignored in declared groups; `render blueprints
+#     validate` and apply both expect it to already exist in the workspace.
+# JWT_VERIFY_KEY stays a rest-server generateValue (fanned out), not in a group.
 # ==========================================================================
 envVarGroups:
   - name: autogpt-platform-secrets
