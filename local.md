@@ -168,23 +168,65 @@ on Render Workflows), run the Workflows task server locally. You do **not** need
 
 Prereqs: [Render CLI](https://render.com/docs/cli) 2.11.0+ (`brew install render`).
 
+Set these in your **gitignored `autogpt_platform/backend/.env`** (your personal
+override) — **not** `.env.default`, which is committed and keeps the template's shared
+default of `rabbitmq` (the simplest, no-extra-tooling path for anyone cloning the repo):
+
 ```bash
-# In autogpt_platform/backend/.env — switch the backend to the Workflows path:
+# autogpt_platform/backend/.env — switch the backend to the Workflows path:
 EXECUTION_BACKEND=workflows
 RENDER_USE_LOCAL_DEV=true          # SDK targets the local task server (no API key)
 RENDER_WORKFLOW_SLUG=local         # any non-empty value works locally
 ```
 
+> **Use option B (core-in-Docker + native app) for this.** The task server runs on your
+> host at `localhost:8120`, so the app must also run on the host to reach it and to share
+> the same DB/Redis. In full-Docker mode (option A) the containers would need
+> `RENDER_LOCAL_DEV_URL=http://host.docker.internal:8120` *and* the host task server can't
+> resolve the Dockerised `db`/`redis` hostnames — not worth the rewiring. A run that falls
+> back to RabbitMQ leaves `renderRunId` empty (see the verify step below).
+
 ```bash
 # Terminal 1 (from autogpt_platform/backend): start the local Workflows task server.
 render workflows dev -- poetry run python -m backend.workflows.main
 
-# Terminal 2: run the backend + frontend as usual (make run-backend / make run-frontend).
+# Terminal 2: run the backend + frontend natively (make run-backend / make run-frontend).
 ```
 
 Local runs/results are held in memory and lost when the task server stops (see the
 [Workflows local-dev docs](https://render.com/docs/workflows-local-development)). To go
 back to the default, unset these vars (or set `EXECUTION_BACKEND=rabbitmq`).
+
+### Verify it — run a graph through Workflows
+
+With the task server running (Terminal 1) and the backend on the Workflows path:
+
+1. **Build a graph.** Open http://localhost:3000/build, add one credential-free block
+   (e.g. **Calculator** or **Store Value**), set an input, and **Save**.
+2. **Run it.** Click **Run**. The run shows up under `/library/agents/<id>`.
+3. **Get the ids and confirm it used Workflows (not RabbitMQ).** Terminal 1 streams the
+   `run_graph_execution` logs and the backend prints `Dispatched graph execution
+   <graph_exec_id> to Render Workflows run_id=<run_id>`. The definitive check is the
+   `renderRunId` column — populated **only** on the Workflows path. Query the latest run
+   (from `autogpt_platform/`):
+
+   ```bash
+   docker compose exec -T db psql -U postgres -d postgres -c \
+     'SELECT id AS graph_exec_id, "userId" AS user_id, "executionStatus", "renderRunId" \
+      FROM platform."AgentGraphExecution" ORDER BY "createdAt" DESC LIMIT 1;'
+   ```
+
+   `graph_exec_id` and `user_id` are your two task arguments. A **non-empty `renderRunId`**
+   confirms it dispatched to Workflows. An **empty `renderRunId`** means it ran on
+   RabbitMQ — the backend isn't on the Workflows path; re-check the env vars above (and in
+   full-Docker mode, that the containers were recreated to pick them up).
+4. **Cross-check in the CLI (optional).** From `backend/`: `render workflows tasks list
+   --local` → `run_graph_execution` → `runs` → your run → `results`. The **input** is
+   `["<graph_exec_id>", "<user_id>"]` and the **result** is `{"status": "completed"}`.
+
+Those two ids are exactly what a manual re-invocation of the task expects. Re-running by
+hand only works within the entry's TTL — the producer deletes the Redis payload
+(`wf:exec_entry:<graph_exec_id>`) once a run finishes.
 
 ---
 

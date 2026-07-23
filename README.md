@@ -22,8 +22,8 @@ declare Workflows yet); the backend reaches it via `RENDER_WORKFLOW_SLUG`.
 ```
                        ┌──────────────────────────┐
    browser  ─────────▶ │  frontend (Next.js, web) │  public HTTPS
-                       │  /auth/v1/* ─┐            │
-                       └──────┬───────┼────────────┘
+                       │  /auth/v1/* ─┐           │
+                       └──────┬───────┼───────────┘
         NEXT_PUBLIC_* (HTTPS) │       │ private proxy
               ┌───────────────┘       ▼
               ▼                 ┌─────────────────────┐
@@ -228,6 +228,8 @@ To run the stack on your own machine — full Docker or core-in-Docker with the 
 native and hot-reloading — see [`local.md`](local.md). Local dev uses the repo's
 `docker-compose.yml` and the **RabbitMQ** execution backend, **not** Render Workflows
 (`EXECUTION_BACKEND=workflows` is a deploy-only concern handled by `render.yaml`).
+You can still exercise the Workflows path locally before deploying — see
+[Verify it — run a graph through Workflows](local.md#verify-it--run-a-graph-through-workflows).
 
 Unlike the single Dashboard env groups used for the Render deploy above, local dev reads
 **three separate `.env` files** — `backend/.env` (all backend services, incl. LLM/copilot
