@@ -82,9 +82,25 @@ steps; the tables there are the source of truth.
 1. Fork this repo and push it to your GitHub/GitLab account.
 2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
    its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
-3. Create the `autogpt-platform-byo-secrets` env group (Dashboard → Env Groups → New) with
-   `ENCRYPTION_KEY`, `RENDER_API_KEY`, the slug from step 2, and your LLM key(s). See
-   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3) and
+3. Create the `autogpt-platform-byo-secrets` env group (Dashboard → Env Groups → New) and add:
+
+   - `ENCRYPTION_KEY` — Fernet key for stored credentials. Generate with
+     `python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"`.
+     Must stay stable and match the Workflow's value (stored creds become undecryptable otherwise).
+   - `RENDER_API_KEY` — Render workspace API key (Dashboard → Settings → API Keys); used to
+     dispatch Workflows.
+   - `RENDER_WORKFLOW_SLUG` — the executor Workflow slug from step 2.
+   - **LLM key(s)** — pick one transport:
+     - **OpenRouter** (default, recommended) — set `OPEN_ROUTER_API_KEY=<key>`; leave
+       `CHAT_USE_OPENROUTER` unset or `true`.
+     - **Direct Anthropic** — set `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false`.
+     - **Subscription** (`claude login`) — set `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true` (advanced/dev
+       only — see [Notes](#notes--tradeoffs)).
+     - Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter fallback).
+
+   All three services link this group via `fromGroup` at apply, and you link it to the Workflow by
+   hand in [step 7](#deploy) — every value is entered once. Full reference:
+   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3),
    [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
 4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
    `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs and the anon key.
