@@ -1,0 +1,557 @@
+# ==========================================================================
+# AutoGPT Platform — Render Blueprint
+# ==========================================================================
+# One-click deploy of the AutoGPT Platform on Render. Assembled from the
+# per-stream fragments in render.fragments/ (now superseded by this file).
+#
+# Topology (all resources: Project `autogpt-platform`, region `oregon`,
+# same workspace — required for private networking):
+#   databases : autogpt-platform-db          (Managed Postgres 18)
+#   keyvalue  : autogpt-platform-keyvalue     (Valkey/Redis, standalone)
+#   cron      : autogpt-platform-mv-refresh   (pg_cron replacement)
+#   pserv     : clamav                        (file scanning)
+#   pserv     : autogpt-platform-gotrue       (self-hosted Supabase Auth)
+#   web       : rest-server                   (FastAPI API, owns migrations)
+#   web       : websocket-server              (WSS event fan-out)
+#   pserv     : scheduler-server              (APScheduler + RPC)
+#   pserv     : database-manager              (Prisma pool over RPC)
+#   web       : frontend                      (Next.js)
+#
+# NOT in this Blueprint (created manually — see README "Manual steps"):
+#   * The executor Render WORKFLOW (Blueprints cannot declare Workflows).
+#     rest-server / scheduler-server reference it via RENDER_WORKFLOW_SLUG.
+# ==========================================================================
+
+previews:
+  generation: off
+
+projects:
+  - name: autogpt-platform
+    environments:
+      - name: production
+
+        databases:
+          # ----------------------------------------------------------------
+          # Managed PostgreSQL 18 — app data (`platform` schema, owned by
+          # Prisma) + GoTrue's `auth` schema. Extensions vector + pg_trgm are
+          # created by the app's migrations.
+          # ----------------------------------------------------------------
+          - name: autogpt-platform-db
+            databaseName: autogpt        # immutable after create
+            user: autogpt                # immutable after create
+            region: oregon               # immutable
+            plan: basic-1gb              # ~97 conns; budget ≈ 47-52. Bump for load.
+            postgresMajorVersion: "18"   # immutable
+            ipAllowList: []              # internal (private network) only
+
+        services:
+          # ----------------------------------------------------------------
+          # Key Value (standalone Redis-compatible Valkey) — locks, queues,
+          # pending-turn buffers, rate-limit counters, shared cache.
+          # ----------------------------------------------------------------
+          - type: keyvalue
+            name: autogpt-platform-keyvalue
+            region: oregon
+            plan: starter                # PAID = disk-backed; do NOT use free
+            ipAllowList: []              # internal-only
+            maxmemoryPolicy: noeviction  # never drop locks/queue/pending keys
+
+          # ----------------------------------------------------------------
+          # pg_cron replacement — refresh the store / suggested-blocks
+          # materialized views on a schedule (Render has no pg_cron).
+          # ----------------------------------------------------------------
+          - type: cron
+            name: autogpt-platform-mv-refresh
+            runtime: image
+            image:
+              url: postgres:18-alpine    # ships psql; matches server major
+            region: oregon
+            plan: starter
+            schedule: "*/15 * * * *"
+            # RAW internal connection string (no ?schema= — libpq rejects it);
+            # SET search_path so the platform-schema functions resolve.
+            dockerCommand: >-
+              psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c
+              "SET search_path TO platform;
+               SELECT refresh_store_materialized_views();
+               SELECT refresh_suggested_blocks_view();"
+            envVars:
+              - key: DATABASE_URL
+                fromDatabase:
+                  name: autogpt-platform-db
+                  property: connectionString
+
+          # ----------------------------------------------------------------
+          # ClamAV — private file-scanning service (raw TCP 3310, no HTTP).
+          # Pinned image; freshclam definitions persisted on a disk.
+          # ----------------------------------------------------------------
+          - type: pserv
+            name: clamav
+            runtime: image
+            region: oregon
+            plan: pro                    # 4 GB RAM (clamd loads full DB to RAM)
+            autoDeployTrigger: "off"     # pinned image; bump tag manually
+            image:
+              url: docker.io/clamav/clamav-debian:1.4.5
+            disk:
+              name: clamav-data
+              mountPath: /var/lib/clamav
+              sizeGB: 2
+            # No healthCheckPath: clamd speaks raw TCP, not HTTP — Render uses
+            # TCP port-open liveness for non-HTTP pservs.
+            envVars:
+              - key: CLAMD_CONF_TCPAddr
+                value: 0.0.0.0
+              - key: CLAMAV_NO_FRESHCLAMD
+                value: "false"
+              - key: CLAMD_CONF_MaxThreads
+                value: "6"
+              - key: CLAMD_CONF_StreamMaxLength
+                value: 50M
+              - key: CLAMD_CONF_MaxFileSize
+                value: 100M
+              - key: CLAMD_CONF_MaxScanSize
+                value: 100M
+              - key: CLAMD_CONF_ReadTimeout
+                value: "300"
+
+          # ----------------------------------------------------------------
+          # GoTrue (Supabase Auth) — private service. Reached only through the
+          # frontend's /auth/v1 rewrite over the private network; never public.
+          # Owns the `auth` schema in autogpt-platform-db.
+          # ----------------------------------------------------------------
+          - type: pserv
+            name: autogpt-platform-gotrue
+            runtime: image
+            region: oregon
+            plan: starter
+            image:
+              url: supabase/gotrue:v2.170.0
+            envVars:
+              - key: GOTRUE_API_HOST
+                value: "0.0.0.0"
+              - key: GOTRUE_API_PORT
+                value: "10000"           # equals Render's default PORT; rewrite
+                                         # target = autogpt-platform-gotrue:10000
+              - key: GOTRUE_API_EXTERNAL_URL
+                sync: false              # DEPLOYER: frontend public origin
+              # --- Database (owns the `auth` schema; NO ?schema=platform) ---
+              - key: GOTRUE_DB_DRIVER
+                value: postgres
+              - key: GOTRUE_DB_DATABASE_URL
+                fromDatabase:
+                  name: autogpt-platform-db
+                  property: connectionString
+              # --- JWT (HS256 shared secret; == backend JWT_VERIFY_KEY) -----
+              # Pulls rest-server's SERVICE-LEVEL generateValue (not a group value),
+              # so this resolves reliably; a mismatch here breaks all auth.
+              - key: GOTRUE_JWT_SECRET
+                fromService:
+                  name: rest-server
+                  type: web
+                  envVarKey: JWT_VERIFY_KEY
+              - key: GOTRUE_JWT_ADMIN_ROLES
+                value: service_role
+              - key: GOTRUE_JWT_AUD
+                value: authenticated
+              - key: GOTRUE_JWT_DEFAULT_GROUP_NAME
+                value: authenticated
+              - key: GOTRUE_JWT_EXP
+                value: "3600"
+              # --- Signup / providers (template-safe defaults) --------------
+              - key: GOTRUE_SITE_URL
+                sync: false              # DEPLOYER: frontend public origin
+              - key: GOTRUE_URI_ALLOW_LIST
+                sync: false              # DEPLOYER: allowed redirect URLs
+              - key: GOTRUE_DISABLE_SIGNUP
+                value: "false"
+              - key: GOTRUE_EXTERNAL_EMAIL_ENABLED
+                value: "true"
+              - key: GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED
+                value: "false"
+              - key: GOTRUE_EXTERNAL_PHONE_ENABLED
+                value: "false"
+              - key: GOTRUE_MAILER_AUTOCONFIRM
+                value: "false"          # set "true" only for a no-SMTP demo
+              - key: GOTRUE_MAILER_URLPATHS_INVITE
+                value: /auth/v1/verify
+              - key: GOTRUE_MAILER_URLPATHS_CONFIRMATION
+                value: /auth/v1/verify
+              - key: GOTRUE_MAILER_URLPATHS_RECOVERY
+                value: /auth/v1/verify
+              - key: GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE
+                value: /auth/v1/verify
+              # --- SMTP (DEPLOYER-supplied — Render has no managed email) ---
+              - key: GOTRUE_SMTP_HOST
+                sync: false
+              - key: GOTRUE_SMTP_PORT
+                sync: false
+              - key: GOTRUE_SMTP_USER
+                sync: false
+              - key: GOTRUE_SMTP_PASS
+                sync: false
+              - key: GOTRUE_SMTP_SENDER_NAME
+                sync: false
+              - key: GOTRUE_SMTP_ADMIN_EMAIL
+                sync: false
+              # --- Google OAuth (DEPLOYER-supplied — optional) --------------
+              - key: GOTRUE_EXTERNAL_GOOGLE_ENABLED
+                sync: false
+              - key: GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID
+                sync: false
+              - key: GOTRUE_EXTERNAL_GOOGLE_SECRET
+                sync: false
+              - key: GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI
+                sync: false
+
+          # ----------------------------------------------------------------
+          # rest-server — public web service. FastAPI API + Prisma owner.
+          # SOLE owner of `prisma migrate deploy` (preDeployCommand).
+          # ----------------------------------------------------------------
+          - type: web
+            name: rest-server
+            runtime: docker
+            region: oregon
+            plan: standard
+            rootDir: .
+            dockerContext: .
+            dockerfilePath: autogpt_platform/backend/Dockerfile
+            # App reads AGENT_API_PORT (not $PORT); wrap DB URLs with ?schema=
+            # (Render can't interpolate env in YAML) then exec `rest`.
+            dockerCommand: >-
+              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              exec env AGENT_API_PORT=$PORT rest'
+            healthCheckPath: /health
+            # Prisma resolves BOTH datasource env refs (url=DATABASE_URL and
+            # directUrl=DIRECT_URL) at schema load — even though `migrate deploy`
+            # connects via DIRECT_URL. So DATABASE_URL must be present too, or the
+            # first deploy fails with "Environment variable not found: DATABASE_URL".
+            # Mirror the dockerCommand, which already exports both.
+            preDeployCommand: >-
+              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              prisma migrate deploy'
+            envVars:
+              # --- Postgres ------------------------------------------------
+              - key: RENDER_DATABASE_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: RENDER_DIRECT_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: DB_SCHEMA
+                value: platform
+              - key: DB_CONNECTION_LIMIT
+                value: "10"
+              # --- Redis / Key Value --------------------------------------
+              - key: REDIS_HOST
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
+              - key: REDIS_PORT
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
+              - key: REDIS_CLUSTER_MODE
+                value: "false"
+              # --- Scheduler RPC client -----------------------------------
+              - key: SCHEDULER_HOST
+                fromService: { name: scheduler-server, type: pserv, property: host }
+              - key: EXECUTION_SCHEDULER_PORT
+                fromService: { name: scheduler-server, type: pserv, property: port }
+              # --- Workflows producer (Stream C) --------------------------
+              - key: EXECUTION_BACKEND
+                value: workflows
+              - key: RENDER_API_KEY
+                sync: false
+              - key: RENDER_WORKFLOW_SLUG
+                sync: false             # set after the Workflow is created, then redeploy
+              # --- ClamAV --------------------------------------------------
+              - key: CLAMAV_SERVICE_HOST
+                fromService: { name: clamav, type: pserv, property: host }
+              - key: CLAMAV_SERVICE_PORT
+                fromService: { name: clamav, type: pserv, property: port }
+              - key: CLAMAV_SERVICE_ENABLED
+                value: "true"
+              - key: CLAMAV_MARK_FAILED_SCANS_AS_CLEAN
+                value: "false"
+              - key: CLAMAV_MAX_CONCURRENCY
+                value: "5"
+              # --- Auth / JWT (config.py hard-fails on empty JWT_VERIFY_KEY) -
+              # rest-server OWNS the HS256 secret: a service-level generateValue.
+              # Every other consumer (ws, scheduler, database-manager, and GoTrue's
+              # GOTRUE_JWT_SECRET) pulls THIS value via `fromService envVarKey`.
+              # It is deliberately NOT in the shared group: a group→service→service
+              # `fromService` chain is not reliably resolvable in Blueprints, and a
+              # silent mismatch means GoTrue signs tokens the backend can't verify.
+              # Referencing a service-level generateValue is the reliable pattern.
+              # UNSUBSCRIBE_SECRET_KEY still comes from the group below.
+              - key: JWT_VERIFY_KEY
+                generateValue: true
+              - key: JWT_SIGN_ALGORITHM
+                value: HS256
+              # ENCRYPTION_KEY: Fernet cipher key for stored credentials.
+              # sync:false (deployer-supplied) NOT generateValue — Render's
+              # generated secret is not guaranteed to be a valid url-safe-base64
+              # Fernet key. MUST be the IDENTICAL value on every backend service
+              # + the executor Workflow. Generate one, paste everywhere; each
+              # service logs a non-secret fingerprint at boot to spot mismatches.
+              # See README.
+              - key: ENCRYPTION_KEY
+                sync: false
+              # --- URLs / CORS / env --------------------------------------
+              - key: APP_ENV
+                value: prod
+              - key: PLATFORM_BASE_URL
+                sync: false             # DEPLOYER: backend public origin
+              - key: FRONTEND_BASE_URL
+                sync: false             # DEPLOYER: frontend public origin
+              - key: BACKEND_CORS_ALLOW_ORIGINS
+                sync: false             # DEPLOYER: JSON array, e.g. ["https://<frontend>"]
+              # --- Shared secrets group (UNSUBSCRIBE_SECRET_KEY) ----------
+              - fromGroup: autogpt-platform-secrets
+
+          # ----------------------------------------------------------------
+          # websocket-server — public web service (WSS). Redis pub/sub fan-out.
+          # ----------------------------------------------------------------
+          - type: web
+            name: websocket-server
+            runtime: docker
+            region: oregon
+            plan: standard
+            rootDir: .
+            dockerContext: .
+            dockerfilePath: autogpt_platform/backend/Dockerfile
+            dockerCommand: >-
+              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              exec env WEBSOCKET_SERVER_PORT=$PORT ws'
+            healthCheckPath: /health
+            envVars:
+              - key: RENDER_DATABASE_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: RENDER_DIRECT_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: DB_SCHEMA
+                value: platform
+              - key: DB_CONNECTION_LIMIT
+                value: "10"
+              - key: REDIS_HOST
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
+              - key: REDIS_PORT
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
+              - key: REDIS_CLUSTER_MODE
+                value: "false"
+              - key: ENABLE_AUTH
+                value: "true"
+              # HS256 secret — pull rest-server's service-level generateValue
+              # (owner) so both verify with the identical key. See rest-server.
+              - key: JWT_VERIFY_KEY
+                fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
+              - key: JWT_SIGN_ALGORITHM
+                value: HS256
+              - key: APP_ENV
+                value: prod
+              - key: BACKEND_CORS_ALLOW_ORIGINS
+                sync: false             # DEPLOYER: same value as rest-server
+              - key: ENCRYPTION_KEY
+                sync: false             # IDENTICAL to rest-server (see rest-server note)
+              - fromGroup: autogpt-platform-secrets
+
+          # ----------------------------------------------------------------
+          # scheduler-server — private service. APScheduler + RPC server.
+          # numInstances: 1 (no leader election). Routes app DB access through
+          # database-manager; uses DIRECT_URL for the APScheduler jobstore.
+          # ----------------------------------------------------------------
+          - type: pserv
+            name: scheduler-server
+            runtime: docker
+            region: oregon
+            plan: standard
+            numInstances: 1
+            rootDir: .
+            dockerContext: .
+            dockerfilePath: autogpt_platform/backend/Dockerfile
+            dockerCommand: >-
+              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              exec env EXECUTION_SCHEDULER_PORT=$PORT scheduler'
+            # NOTE: pserv cannot declare healthCheckPath in a Blueprint. The
+            # scheduler serves /health_check on its RPC port; set the health
+            # check in the Dashboard after create if desired.
+            envVars:
+              - key: PYRO_HOST
+                value: "0.0.0.0"
+              - key: RENDER_DATABASE_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: RENDER_DIRECT_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: DB_SCHEMA
+                value: platform
+              - key: DB_CONNECTION_LIMIT
+                value: "10"
+              - key: DATABASEMANAGER_HOST
+                fromService: { name: database-manager, type: pserv, property: host }
+              - key: DATABASE_API_PORT
+                fromService: { name: database-manager, type: pserv, property: port }
+              - key: REDIS_HOST
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
+              - key: REDIS_PORT
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
+              - key: REDIS_CLUSTER_MODE
+                value: "false"
+              - key: EXECUTION_BACKEND
+                value: workflows
+              - key: RENDER_API_KEY
+                sync: false
+              - key: RENDER_WORKFLOW_SLUG
+                sync: false             # same value as rest-server (post-Workflow)
+              # HS256 secret — config hard-fails on an empty JWT_VERIFY_KEY, so
+              # pull rest-server's service-level generateValue (owner).
+              - key: JWT_VERIFY_KEY
+                fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
+              - key: APP_ENV
+                value: prod
+              - key: ENCRYPTION_KEY
+                sync: false             # IDENTICAL to rest-server (see rest-server note)
+              - fromGroup: autogpt-platform-secrets
+
+          # ----------------------------------------------------------------
+          # database-manager — private service. Centralized Prisma pool over
+          # RPC (dockerCommand `db`). Required by scheduler-server (decision #4).
+          # ----------------------------------------------------------------
+          - type: pserv
+            name: database-manager
+            runtime: docker
+            region: oregon
+            plan: standard
+            numInstances: 1
+            rootDir: .
+            dockerContext: .
+            dockerfilePath: autogpt_platform/backend/Dockerfile
+            dockerCommand: >-
+              /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
+              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              exec env DATABASE_API_PORT=$PORT db'
+            # NOTE: pserv cannot declare healthCheckPath in a Blueprint.
+            envVars:
+              - key: PYRO_HOST
+                value: "0.0.0.0"
+              - key: RENDER_DATABASE_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: RENDER_DIRECT_URL
+                fromDatabase: { name: autogpt-platform-db, property: connectionString }
+              - key: DB_SCHEMA
+                value: platform
+              - key: DB_CONNECTION_LIMIT
+                value: "10"
+              - key: REDIS_HOST
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: host }
+              - key: REDIS_PORT
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: port }
+              # Full internal connection string (redis://host:port; also carries
+              # credentials if internal auth is enabled in the Dashboard). The
+              # standalone Redis client prefers REDIS_URL over the split
+              # REDIS_HOST/PORT/PASSWORD vars, so this stays correct whether or
+              # not internal auth is turned on. See README.
+              - key: REDIS_URL
+                fromService: { name: autogpt-platform-keyvalue, type: keyvalue, property: connectionString }
+              - key: REDIS_CLUSTER_MODE
+                value: "false"
+              # HS256 secret — config hard-fails on an empty JWT_VERIFY_KEY, so
+              # pull rest-server's service-level generateValue (owner).
+              - key: JWT_VERIFY_KEY
+                fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
+              - key: APP_ENV
+                value: prod
+              - key: ENCRYPTION_KEY
+                sync: false             # IDENTICAL to rest-server (see rest-server note)
+              - fromGroup: autogpt-platform-secrets
+
+          # ----------------------------------------------------------------
+          # frontend — Next.js public web service (Node runtime).
+          # NEXT_PUBLIC_* are inlined at BUILD time → must be the PUBLIC URLs
+          # and set (sync:false) before the first build.
+          # ----------------------------------------------------------------
+          - type: web
+            name: frontend
+            runtime: node
+            region: oregon
+            plan: standard
+            rootDir: autogpt_platform/frontend
+            buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm generate:api && pnpm exec cross-env NODE_OPTIONS=--max-old-space-size=4096 next build
+            startCommand: pnpm start
+            healthCheckPath: /health
+            envVars:
+              - key: NODE_VERSION
+                value: "24"
+              - key: NODE_OPTIONS
+                value: --max-old-space-size=4096
+              - key: NEXT_PUBLIC_SOURCEMAPS
+                value: "false"
+              # --- Public backend URLs (inlined at build) ------------------
+              - key: NEXT_PUBLIC_AGPT_SERVER_URL
+                sync: false             # DEPLOYER: https://<rest-server host>/api
+              - key: NEXT_PUBLIC_AGPT_WS_SERVER_URL
+                sync: false             # DEPLOYER: wss://<websocket-server host>/ws
+              # --- Private backend URL for SSR (skips public round-trip) ---
+              # NOTE: :10000 MUST equal rest-server's internal $PORT. Render
+              # Blueprints can't concatenate scheme + hostport + "/api", so this
+              # is spelled out literally; if rest-server's $PORT ever changes,
+              # update this port too (or switch the frontend to read a bare
+              # `fromService rest-server hostport` and build the URL in app
+              # config). See README.
+              - key: AGPT_SERVER_URL
+                value: http://rest-server:10000/api
+              # --- Auth: supabase-js hits this frontend's own origin, which
+              #     the /auth/v1 rewrite proxies to GoTrue (private) --------
+              - key: NEXT_PUBLIC_SUPABASE_URL
+                sync: false             # DEPLOYER: this frontend's own public origin
+              - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+                sync: false             # DEPLOYER: anon JWT signed with JWT_VERIFY_KEY
+              - key: GOTRUE_INTERNAL_URL
+                fromService:
+                  name: autogpt-platform-gotrue
+                  type: pserv
+                  property: hostport    # -> autogpt-platform-gotrue:10000
+              # --- Own origin (CORS + next/image allow-list) ---------------
+              - key: NEXT_PUBLIC_FRONTEND_BASE_URL
+                sync: false             # DEPLOYER: this frontend's own public origin
+
+# ==========================================================================
+# Shared secrets — workspace env group referenced via `fromGroup`.
+# generateValue is created ONCE and persists across syncs. sync:false is
+# IGNORED inside groups, so every Dashboard-prompt secret lives on its
+# service (above), NOT here.
+#   * UNSUBSCRIBE_SECRET_KEY  signs email unsubscribe links.
+# NOTE: JWT_VERIFY_KEY is deliberately NOT in this group. GoTrue/ws/scheduler/
+# database-manager pull it via `fromService envVarKey: JWT_VERIFY_KEY` from
+# rest-server, and a group→service→service `fromService` chain is not reliably
+# resolvable in Blueprints. It is a SERVICE-LEVEL generateValue on rest-server
+# (the owner) instead. See the rest-server JWT note above.
+# NOTE: ENCRYPTION_KEY is deliberately NOT in this group. It must be a valid
+# url-safe-base64 Fernet key, which generateValue does not guarantee, and
+# sync:false is ignored inside groups — so it is set per-service as sync:false
+# (deployer-supplied). See the rest-server note above and the README.
+# ==========================================================================
+envVarGroups:
+  - name: autogpt-platform-secrets
+    envVars:
+      - key: UNSUBSCRIBE_SECRET_KEY
+        generateValue: true

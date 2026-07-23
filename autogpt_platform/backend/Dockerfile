@@ -81,8 +81,10 @@ COPY --from=builder /usr/bin/npm /usr/bin/npm
 # Copy Prisma binaries
 COPY --from=builder /root/.cache/prisma-python/binaries /root/.cache/prisma-python/binaries
 
-# Install prisma-client-py directly (much smaller than copying full venv)
-RUN pip3 install prisma>=0.15.0 --break-system-packages
+# Install prisma-client-py directly (much smaller than copying full venv).
+# Pinned to the exact version in poetry.lock so the migrate stage can't silently
+# drift onto a newer, untested Prisma than the app/server stage was built with.
+RUN pip3 install prisma==0.15.0 --break-system-packages
 
 COPY autogpt_platform/backend/schema.prisma ./
 COPY autogpt_platform/backend/backend/data/partial_types.py ./backend/data/partial_types.py
@@ -159,6 +161,18 @@ COPY docs /app/docs
 # (e.g., rest, executor, ws, db, scheduler, notification - see [tool.poetry.scripts])
 RUN POETRY_VIRTUALENVS_CREATE=true POETRY_VIRTUALENVS_IN_PROJECT=true \
     poetry install --no-ansi --only-root
+
+# Producer services (rest_server, scheduler_server) dispatch graph executions to
+# Render Workflows via backend/workflows/client.py, which imports render_sdk
+# lazily at first dispatch. render_sdk is intentionally NOT in pyproject.toml:
+# its transitive dep openapi-python-client pins ruff <0.14, conflicting with the
+# repo's ruff ^0.15, so Poetry can't resolve it. Install it --no-deps so the
+# toolchain isn't downgraded (only aiohttp/httpx are needed at runtime, already
+# backend deps). The version + wheel hashes live in one place —
+# render_sdk.requirements.txt — and --require-hashes makes the install
+# reproducible and tamper-evident, so a new release can't silently swap the
+# artifact. Harmless/unused on ws + database_manager, which share this one image.
+RUN poetry run pip install --no-deps --require-hashes -r render_sdk.requirements.txt
 
 ENV PORT=8000
 
