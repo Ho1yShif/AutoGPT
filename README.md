@@ -67,39 +67,103 @@ declare Workflows yet); the backend reaches it via `RENDER_WORKFLOW_SLUG`.
 
 ## Secrets & environment
 
-### Auto-generated (env group `autogpt-platform-secrets`)
+Every environment value falls into exactly one of **four buckets**. Knowing the bucket
+tells you *where* the value lives and *when* you set it. Two of the buckets are env groups.
 
-Created once by Render and shared across services via `fromGroup`; you never set these by hand.
+### Overview
 
-| Key | Used by | Notes |
-|-----|---------|-------|
-| `JWT_VERIFY_KEY` | rest, ws, scheduler, db-manager, GoTrue | HS256 secret; copied into GoTrue's `GOTRUE_JWT_SECRET`. |
-| `UNSUBSCRIBE_SECRET_KEY` | rest | Signs email unsubscribe links. |
+| # | Bucket | Where it lives | Who sets it | When |
+|---|--------|----------------|-------------|------|
+| 1 | **Automatic wires** | on each service, via `fromDatabase` / `fromService` | Render, from `render.yaml` | at apply — nothing to do |
+| 2 | **Env group `autogpt-platform-secrets`** | the Blueprint-managed group | Render (`generateValue`) | at apply — never touched by you |
+| 3 | **Per-service Dashboard prompts** (`sync: false`) | on the individual service | **you**, in the Dashboard | some at apply, some after URLs exist |
+| 4 | **Env group `autogpt-platform-llm`** | a Dashboard-only group **you create** | **you** | last, after the Workflow exists |
 
-> `ENCRYPTION_KEY` is **not** auto-generated — Render's `generateValue` is not guaranteed to
-> be a valid Fernet key. It is deployer-supplied instead (see the table below).
+There are **only two env groups**, and they are not interchangeable:
 
-### Deployer-supplied (Dashboard prompts, `sync: false`)
+- **`autogpt-platform-secrets`** — declared in `render.yaml`, created automatically, holds
+  only `UNSUBSCRIBE_SECRET_KEY` (`generateValue`). **You never add keys to it.**
+- **`autogpt-platform-llm`** — **not** in `render.yaml`; you create it by hand in the
+  Dashboard and link it to two consumers. It is the **only** group you touch. LLM keys go
+  here (see [Manual step — LLM / Claude API keys](#manual-step--llm--claude-api-keys)).
 
-`sync: false` is ignored inside env groups, so these live on individual services and are
-entered in the Dashboard at deploy time.
+Everything else is per-service: bucket 1 (wires) needs no action, bucket 3 (`sync: false`
+prompts) is the list you actually fill in. **Do not** put bucket-3 keys in an env group —
+`sync: false` is ignored inside groups, so a secret placed there silently becomes blank.
+
+> Two auto-generated keys are **not** in the `autogpt-platform-secrets` group even though
+> they look like they should be: `JWT_VERIFY_KEY` is a **service-level `generateValue` on
+> rest-server** (every other service and GoTrue pull it via `fromService` — bucket 1), and
+> `ENCRYPTION_KEY` is **not** auto-generated at all — Render's `generateValue` isn't a valid
+> Fernet key, so it is deployer-supplied (bucket 3, below).
+
+### The URL config layer — fewer keys to enter
+
+Every service internally wants a handful of URL variables (`PLATFORM_BASE_URL`,
+`BACKEND_CORS_ALLOW_ORIGINS`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_FRONTEND_BASE_URL`,
+…), but almost all of them collapse to a few origins. `render.yaml` derives the rest in the
+build/start commands so **you enter each origin at most once**:
+
+- **Backend → one keyname: `FRONTEND_BASE_URL`** (the frontend's public origin, `F`), set
+  once on `rest-server`. Its start command derives `PLATFORM_BASE_URL` from Render's
+  auto-injected `RENDER_EXTERNAL_URL` (the API's own origin) and
+  `BACKEND_CORS_ALLOW_ORIGINS` from `F`. `websocket-server`, `scheduler-server`, and
+  `database-manager` pull `FRONTEND_BASE_URL` from `rest-server` via `fromService` — you
+  never re-enter it.
+- **Frontend → two keynames: `NEXT_PUBLIC_AGPT_SERVER_URL` (API, `R`) and
+  `NEXT_PUBLIC_AGPT_WS_SERVER_URL` (WebSocket, `W`).** These are separate Render services,
+  so they can't be derived. The frontend's *own* origin (used for
+  `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_FRONTEND_BASE_URL`) is derived from its
+  build-time `RENDER_EXTERNAL_URL`, so those two are **not** prompted for.
+
+Each derived var uses `${VAR:-…}`, so if you later add a **custom domain** you can set the
+real value in the Dashboard and it overrides the derived default.
+
+### Set the deployer-supplied keys (bucket 3)
+
+`sync: false` prompts split by *when their value is knowable*:
+
+1. **Before / at apply — values you already control:** `ENCRYPTION_KEY` (generate once,
+   paste the same value into rest, ws, scheduler, db-manager), `RENDER_API_KEY` (rest +
+   scheduler), and SMTP (`GOTRUE_SMTP_*`) if you have it. For the URL-dependent keys below,
+   enter a **valid `https://` placeholder** now (e.g. `https://example.com`) — an empty or
+   malformed value fails URL/CORS validation at boot.
+2. **After the first apply — values that need the `*.onrender.com` hostnames:** on the
+   **frontend**, `NEXT_PUBLIC_AGPT_SERVER_URL` (`https://<rest-server host>/api`),
+   `NEXT_PUBLIC_AGPT_WS_SERVER_URL` (`wss://<websocket-server host>/ws`), and
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY` (mint it from the now-generated `JWT_VERIFY_KEY`); on
+   **rest-server**, `FRONTEND_BASE_URL` (the frontend origin — the single backend keyname);
+   on **gotrue**, the origins `GOTRUE_SITE_URL`, `GOTRUE_API_EXTERNAL_URL`,
+   `GOTRUE_URI_ALLOW_LIST` (all the frontend origin + allowed redirects). Then **redeploy
+   the frontend and rest-server** (`NEXT_PUBLIC_*` are inlined at build; the backend
+   derives its URLs at start). `PLATFORM_BASE_URL`, `BACKEND_CORS_ALLOW_ORIGINS`,
+   `NEXT_PUBLIC_SUPABASE_URL`, and `NEXT_PUBLIC_FRONTEND_BASE_URL` are **derived — do not
+   enter them**.
+3. **After the Workflow exists:** `RENDER_WORKFLOW_SLUG` (rest + scheduler), then redeploy
+   those two. See [Manual step — the executor Workflow](#manual-step--the-executor-workflow).
+
+### The full deployer-supplied list (bucket 3)
+
+These live on individual services and are required to enter in the Dashboard at deploy time. Other environment variables are either optional or added in a later step.
 
 | Key | Service(s) | What to enter |
 |-----|-----------|---------------|
-| `ENCRYPTION_KEY` | rest, ws, scheduler, db-manager, **Workflow** | Fernet key for stored credentials — **generate once, paste the identical value into all 5** (see below) |
+| `ENCRYPTION_KEY` | rest, ws, scheduler, db-manager, **Workflow** | Fernet key for stored credentials — **generate once with this command and paste the identical value into all 5**: `python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"` |
 | `RENDER_API_KEY` | rest-server, scheduler-server | Render workspace API key (Workflows dispatch) |
 | `RENDER_WORKFLOW_SLUG` | rest-server, scheduler-server | Slug of the manual executor Workflow — **unknown until it exists**; set + redeploy |
-| `PLATFORM_BASE_URL` | rest-server | Backend (rest-server) public origin |
-| `FRONTEND_BASE_URL` | rest-server | Frontend public origin |
-| `BACKEND_CORS_ALLOW_ORIGINS` | rest-server, websocket-server | JSON array, e.g. `["https://your-frontend.onrender.com"]` — scope to the frontend origin only |
+| `FRONTEND_BASE_URL` | rest-server | Frontend public origin — **the single backend URL keyname**; ws/scheduler/db-manager pull it via `fromService`, and `PLATFORM_BASE_URL` + `BACKEND_CORS_ALLOW_ORIGINS` are derived from it |
 | `NEXT_PUBLIC_AGPT_SERVER_URL` | frontend | `https://<rest-server host>/api` (build-time) |
 | `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend | `wss://<websocket-server host>/ws` (build-time) |
-| `NEXT_PUBLIC_SUPABASE_URL` | frontend | The **frontend's own** public origin (auth proxies through it) |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | frontend | Anon JWT signed with `JWT_VERIFY_KEY` (see below) |
-| `NEXT_PUBLIC_FRONTEND_BASE_URL` | frontend | The frontend's own public origin |
 | `GOTRUE_SITE_URL`, `GOTRUE_API_EXTERNAL_URL`, `GOTRUE_URI_ALLOW_LIST` | gotrue | Frontend origin + allowed redirect URLs |
 | `GOTRUE_SMTP_*` | gotrue | SMTP host/port/user/pass/sender/admin (email confirm, reset, change) |
 | `GOTRUE_EXTERNAL_GOOGLE_*` | gotrue | Optional Google OAuth (leave `ENABLED=false` to skip) |
+
+**Derived — not prompted for** (see [The URL config layer](#the-url-config-layer--fewer-keys-to-enter)):
+`PLATFORM_BASE_URL` and `BACKEND_CORS_ALLOW_ORIGINS` (from `FRONTEND_BASE_URL` +
+`RENDER_EXTERNAL_URL`), and `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_FRONTEND_BASE_URL`
+(from the frontend's own `RENDER_EXTERNAL_URL`). Set them in the Dashboard only to override
+the derived default for a custom domain.
 
 The authoritative list of deployer-supplied values is [`render.yaml`](render.yaml) itself —
 every one is a `sync: false` entry annotated with a `# DEPLOYER:` comment, and Render prompts
@@ -110,16 +174,23 @@ for them when you deploy the Blueprint. The table above is the human-readable su
 
 #### Generating the anon key
 
-`NEXT_PUBLIC_SUPABASE_ANON_KEY` is a JWT signed with `JWT_VERIFY_KEY` (read the generated
-value from the env group after the first deploy):
+`NEXT_PUBLIC_SUPABASE_ANON_KEY` is an HS256 JWT signed with `JWT_VERIFY_KEY`. Read that
+value from **rest-server**'s environment after the first deploy (it's the service-level
+`generateValue`, not an env-group value), then mint the token with stdlib — no dependencies:
 
-```
-header:  {"alg":"HS256","typ":"JWT"}
-payload: {"role":"anon","iss":"supabase","aud":"authenticated"}
+```bash
+JWT_VERIFY_KEY='<paste from rest-server env>' python3 - <<'PY'
+import os, json, hmac, hashlib, base64
+b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=")
+seg = lambda d: b64(json.dumps(d, separators=(",", ":")).encode())
+h = seg({"alg": "HS256", "typ": "JWT"})
+p = seg({"role": "anon", "iss": "supabase", "aud": "authenticated"})
+sig = b64(hmac.new(os.environ["JWT_VERIFY_KEY"].encode(), h + b"." + p, hashlib.sha256).digest())
+print((h + b"." + p + b"." + sig).decode())
+PY
 ```
 
-Sign it with the group's `JWT_VERIFY_KEY` (e.g. via jwt.io). For a no-Kong deploy any
-non-empty value works, but a correct anon JWT is recommended.
+For a no-Kong deploy any non-empty value works, but a correct anon JWT is recommended.
 
 #### Generating `ENCRYPTION_KEY`
 
@@ -127,11 +198,16 @@ The backend loads `ENCRYPTION_KEY` as a `cryptography.fernet.Fernet` key — it 
 url-safe base64 of exactly 32 bytes, which Render's `generateValue` does **not** guarantee
 (it can emit `+`/`/` chars that Fernet rejects). So it is deployer-supplied. Generate **one**
 key and paste that **identical** value into all five places (`rest-server`,
-`websocket-server`, `scheduler-server`, `database-manager`, and the executor Workflow):
+`websocket-server`, `scheduler-server`, `database-manager`, and the executor Workflow). A
+Fernet key is just url-safe base64 of 32 random bytes, so stdlib produces one — no
+`cryptography` install needed:
 
 ```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 ```
+
+(Equivalent to `cryptography.fernet.Fernet.generate_key()` if you happen to have that
+package installed: `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`.)
 
 Each backend service logs a non-secret fingerprint at boot —
 `ENCRYPTION_KEY loaded (fingerprint=<12 hex chars>)`. Confirm every service prints the
@@ -143,20 +219,41 @@ with a clear error instead of an opaque runtime `InvalidToken`.
 
 ## Deploy
 
+Follow the buckets from [Secrets & environment](#secrets--environment) in order:
+
 1. **Fork** this repo and push it to your GitHub/GitLab account.
-2. In Render, **New → Blueprint**, select your fork. Render reads `render.yaml`.
-3. Fill in the `sync: false` prompts you already know (SMTP, CORS placeholders, etc.).
-   The frontend `NEXT_PUBLIC_*` URLs depend on the service hostnames — you can set
-   placeholders now and correct them in step 5.
-4. **Apply.** Postgres, Key Value, GoTrue, ClamAV, the four backend services, the cron,
-   and the frontend come up. `rest-server` runs `prisma migrate deploy` on predeploy.
-5. **Set the real public URLs.** Once services have their `*.onrender.com` hostnames (or
-   your custom domains), set on the **frontend**: `NEXT_PUBLIC_AGPT_SERVER_URL`,
-   `NEXT_PUBLIC_AGPT_WS_SERVER_URL`, `NEXT_PUBLIC_SUPABASE_URL`,
-   `NEXT_PUBLIC_FRONTEND_BASE_URL`; and on **gotrue**: `GOTRUE_SITE_URL`,
-   `GOTRUE_API_EXTERNAL_URL`, `GOTRUE_URI_ALLOW_LIST`; and `PLATFORM_BASE_URL` /
-   `FRONTEND_BASE_URL` / `BACKEND_CORS_ALLOW_ORIGINS` on the backend. Redeploy the frontend
-   (its `NEXT_PUBLIC_*` are inlined at build time).
+2. **Generate `ENCRYPTION_KEY` first** (see [below](#generating-encryption_key)) and grab
+   your `RENDER_API_KEY` from Dashboard → Settings → API Keys. You'll paste these into the
+   Blueprint prompts in the next step — having them ready avoids a second pass.
+3. In Render, **New → Blueprint**, select your fork. Render reads `render.yaml` and prompts
+   for every `sync: false` key (bucket 3).
+4. **Fill the bucket-3 "phase 1" prompts** — `ENCRYPTION_KEY` (identical value on rest, ws,
+   scheduler, db-manager), `RENDER_API_KEY` (rest + scheduler), and SMTP if you have it. For
+   the URL-dependent keys (`FRONTEND_BASE_URL`, the frontend `NEXT_PUBLIC_AGPT_*`, GoTrue
+   origins, anon key) enter a **valid `https://` placeholder** now (e.g.
+   `https://example.com`) — you can't know the hostnames yet, and an empty value fails
+   URL/CORS validation at boot. Leave `RENDER_WORKFLOW_SLUG` as a placeholder. You are
+   **not** prompted for the derived vars (`PLATFORM_BASE_URL`, `BACKEND_CORS_ALLOW_ORIGINS`,
+   `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_FRONTEND_BASE_URL`).
+5. **Apply.** Postgres, Key Value, GoTrue, ClamAV, the four backend services, the cron, and
+   the frontend come up. Render auto-creates the `autogpt-platform-secrets` group (bucket 2)
+   and the service-level `JWT_VERIFY_KEY`; `rest-server` runs `prisma migrate deploy` on
+   predeploy.
+6. **Set the real public URLs (bucket 3, phase 2).** Once services have their
+   `*.onrender.com` hostnames (or your custom domains), set on the **frontend**:
+   `NEXT_PUBLIC_AGPT_SERVER_URL`, `NEXT_PUBLIC_AGPT_WS_SERVER_URL`, and
+   `NEXT_PUBLIC_SUPABASE_ANON_KEY` (mint from `JWT_VERIFY_KEY` — see below); on
+   **rest-server**: `FRONTEND_BASE_URL` (the frontend origin); on **gotrue**:
+   `GOTRUE_SITE_URL`, `GOTRUE_API_EXTERNAL_URL`, `GOTRUE_URI_ALLOW_LIST`. Then redeploy the
+   **frontend** (its `NEXT_PUBLIC_*` are inlined at build) and **rest-server** (it derives
+   `PLATFORM_BASE_URL` / `BACKEND_CORS_ALLOW_ORIGINS` at start; ws/scheduler/db-manager pick
+   up `FRONTEND_BASE_URL` on their next deploy). `NEXT_PUBLIC_SUPABASE_URL` and
+   `NEXT_PUBLIC_FRONTEND_BASE_URL` are derived from the frontend's own origin — leave them
+   unset unless you use a custom domain.
+
+Then do the two manual steps below **in order**: create the executor Workflow (sets
+`RENDER_WORKFLOW_SLUG`, bucket 3 phase 3), then create the `autogpt-platform-llm` env group
+(bucket 4) — it's created last because it links to the Workflow.
 
 ### Manual step — the executor Workflow
 
@@ -189,7 +286,8 @@ Blueprint resource, these keys are **not** in `render.yaml`. Instead use one
 Dashboard-managed env group read by both consumers, so each key is entered exactly once:
 
 1. **Create the env group.** Dashboard → Env Groups → New → name it
-   **`autogpt-platform-llm`**. (Dashboard-managed; do **not** add it to `render.yaml`.)
+   **`autogpt-platform-llm`**. This is **bucket 4 — the only env group you create by hand**
+   (Dashboard-managed; do **not** add it to `render.yaml`).
 2. **Add the keys for the transport you want** (pick one):
 
    | Transport | Env to set | Render? |

@@ -218,9 +218,20 @@ projects:
             dockerfilePath: autogpt_platform/backend/Dockerfile
             # App reads AGENT_API_PORT (not $PORT); wrap DB URLs with ?schema=
             # (Render can't interpolate env in YAML) then exec `rest`.
+            # URL-config layer (approach C, boundary realization): the deployer
+            # supplies ONE backend keyname — FRONTEND_BASE_URL (F). Everything
+            # else is DERIVED here so it never has to be entered again:
+            #   * PLATFORM_BASE_URL (R, the public API origin) <- Render's
+            #     auto-injected RENDER_EXTERNAL_URL (rest-server's own URL).
+            #   * BACKEND_CORS_ALLOW_ORIGINS <- [F] (JSON array).
+            # Both use ${VAR:-...} so a Dashboard override still wins (custom
+            # domains). ws / scheduler / database-manager pull F from here via
+            # `fromService envVarKey: FRONTEND_BASE_URL`.
             dockerCommand: >-
               /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              export PLATFORM_BASE_URL="${PLATFORM_BASE_URL:-$RENDER_EXTERNAL_URL}";
+              export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
               exec env AGENT_API_PORT=$PORT rest'
             healthCheckPath: /health
             # Prisma resolves BOTH datasource env refs (url=DATABASE_URL and
@@ -304,12 +315,16 @@ projects:
               # --- URLs / CORS / env --------------------------------------
               - key: APP_ENV
                 value: prod
-              - key: PLATFORM_BASE_URL
-                sync: false             # DEPLOYER: backend public origin
+              # THE single backend URL keyname. Enter the frontend's public
+              # origin (e.g. https://<frontend>.onrender.com) ONCE, here. On the
+              # first apply enter a valid https placeholder (e.g.
+              # https://example.com — an empty/invalid value fails CORS
+              # validation at boot), then set the real origin and redeploy.
+              # PLATFORM_BASE_URL and BACKEND_CORS_ALLOW_ORIGINS are DERIVED from
+              # this + RENDER_EXTERNAL_URL in the dockerCommand above; ws /
+              # scheduler / database-manager pull this value via fromService.
               - key: FRONTEND_BASE_URL
-                sync: false             # DEPLOYER: frontend public origin
-              - key: BACKEND_CORS_ALLOW_ORIGINS
-                sync: false             # DEPLOYER: JSON array, e.g. ["https://<frontend>"]
+                sync: false             # DEPLOYER: frontend public origin (the one backend keyname)
               # --- Shared secrets group (UNSUBSCRIBE_SECRET_KEY) ----------
               - fromGroup: autogpt-platform-secrets
 
@@ -324,9 +339,12 @@ projects:
             rootDir: .
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
+            # Derive CORS from the single FRONTEND_BASE_URL keyname (pulled from
+            # rest-server via fromService below), same as rest-server.
             dockerCommand: >-
               /bin/sh -c 'export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
               export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
+              export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
               exec env WEBSOCKET_SERVER_PORT=$PORT ws'
             healthCheckPath: /health
             envVars:
@@ -361,8 +379,10 @@ projects:
                 value: HS256
               - key: APP_ENV
                 value: prod
-              - key: BACKEND_CORS_ALLOW_ORIGINS
-                sync: false             # DEPLOYER: same value as rest-server
+              # Pull the single FRONTEND_BASE_URL keyname from rest-server (the
+              # owner); dockerCommand derives BACKEND_CORS_ALLOW_ORIGINS from it.
+              - key: FRONTEND_BASE_URL
+                fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
               - key: ENCRYPTION_KEY
                 sync: false             # IDENTICAL to rest-server (see rest-server note)
               - fromGroup: autogpt-platform-secrets
@@ -428,6 +448,10 @@ projects:
                 fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
               - key: APP_ENV
                 value: prod
+              # Billing / email links read frontend_base_url; pull the single
+              # keyname from rest-server (the owner).
+              - key: FRONTEND_BASE_URL
+                fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
               - key: ENCRYPTION_KEY
                 sync: false             # IDENTICAL to rest-server (see rest-server note)
               - fromGroup: autogpt-platform-secrets
@@ -480,6 +504,10 @@ projects:
                 fromService: { name: rest-server, type: web, envVarKey: JWT_VERIFY_KEY }
               - key: APP_ENV
                 value: prod
+              # Credit / notification links read frontend_base_url; pull the
+              # single keyname from rest-server (the owner).
+              - key: FRONTEND_BASE_URL
+                fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
               - key: ENCRYPTION_KEY
                 sync: false             # IDENTICAL to rest-server (see rest-server note)
               - fromGroup: autogpt-platform-secrets
@@ -495,7 +523,14 @@ projects:
             region: oregon
             plan: standard
             rootDir: autogpt_platform/frontend
-            buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm generate:api && pnpm exec cross-env NODE_OPTIONS=--max-old-space-size=4096 next build
+            # The frontend's OWN origin (F) feeds NEXT_PUBLIC_SUPABASE_URL
+            # (supabase-js hits same-origin /auth/v1, proxied to GoTrue) and
+            # NEXT_PUBLIC_FRONTEND_BASE_URL (next/image + font CORS). Both are
+            # DERIVED here from Render's build-time RENDER_EXTERNAL_URL, so the
+            # deployer never enters them. ${VAR:-...} keeps any Dashboard
+            # override (custom domain). NEXT_PUBLIC_* are inlined at build, so
+            # these exports must run before `next build`.
+            buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm generate:api && export NEXT_PUBLIC_SUPABASE_URL="${NEXT_PUBLIC_SUPABASE_URL:-$RENDER_EXTERNAL_URL}" && export NEXT_PUBLIC_FRONTEND_BASE_URL="${NEXT_PUBLIC_FRONTEND_BASE_URL:-$RENDER_EXTERNAL_URL}" && pnpm exec cross-env NODE_OPTIONS=--max-old-space-size=4096 next build
             startCommand: pnpm start
             healthCheckPath: /health
             envVars:
@@ -506,6 +541,11 @@ projects:
               - key: NEXT_PUBLIC_SOURCEMAPS
                 value: "false"
               # --- Public backend URLs (inlined at build) ------------------
+              # The two frontend URL keynames the deployer supplies: the API (R)
+              # and WebSocket (W) origins. These are separate Render services, so
+              # they can't be derived from RENDER_EXTERNAL_URL (which is this
+              # frontend's own origin). The frontend's own origin is derived in
+              # buildCommand above, not entered here.
               - key: NEXT_PUBLIC_AGPT_SERVER_URL
                 sync: false             # DEPLOYER: https://<rest-server host>/api
               - key: NEXT_PUBLIC_AGPT_WS_SERVER_URL
@@ -520,9 +560,10 @@ projects:
               - key: AGPT_SERVER_URL
                 value: http://rest-server:10000/api
               # --- Auth: supabase-js hits this frontend's own origin, which
-              #     the /auth/v1 rewrite proxies to GoTrue (private) --------
-              - key: NEXT_PUBLIC_SUPABASE_URL
-                sync: false             # DEPLOYER: this frontend's own public origin
+              #     the /auth/v1 rewrite proxies to GoTrue (private). The URL
+              #     (NEXT_PUBLIC_SUPABASE_URL) is derived from the frontend's own
+              #     origin in buildCommand above; only the anon-key CREDENTIAL is
+              #     deployer-supplied here (it is not a URL). --------
               - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
                 sync: false             # DEPLOYER: anon JWT signed with JWT_VERIFY_KEY
               - key: GOTRUE_INTERNAL_URL
@@ -530,9 +571,6 @@ projects:
                   name: autogpt-platform-gotrue
                   type: pserv
                   property: hostport    # -> autogpt-platform-gotrue:10000
-              # --- Own origin (CORS + next/image allow-list) ---------------
-              - key: NEXT_PUBLIC_FRONTEND_BASE_URL
-                sync: false             # DEPLOYER: this frontend's own public origin
 
 # ==========================================================================
 # Shared secrets — workspace env group referenced via `fromGroup`.
