@@ -1109,6 +1109,48 @@ async def test_stop_graph_execution_cascades_to_child_with_reviews(
     assert mock_execution_db.update_graph_execution_stats.call_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_stop_graph_execution_rejects_non_owner_before_signalling(
+    mocker: MockerFixture,
+):
+    """A caller who doesn't own the execution must get NotFoundError and must
+    NOT emit any cancel signal — even with wait_timeout=0, which returns before
+    the wait loop's ownership-scoped read. `request_cancel` / the RabbitMQ
+    fan-out are unauthenticated primitives, so this up-front ownership check is
+    the only thing preventing cross-tenant termination."""
+    from backend.executor.utils import stop_graph_execution
+    from backend.util.exceptions import NotFoundError
+
+    mock_prisma = mocker.patch("backend.executor.utils.prisma")
+    mock_prisma.is_connected.return_value = True
+
+    # Ownership-scoped lookup returns None (not the caller's execution).
+    mock_execution_db = mocker.patch("backend.executor.utils.execution_db")
+    mock_execution_db.get_graph_execution_meta = mocker.AsyncMock(return_value=None)
+
+    mock_get_queue = mocker.patch("backend.executor.utils.get_async_execution_queue")
+    mock_queue_client = mocker.AsyncMock()
+    mock_get_queue.return_value = mock_queue_client
+
+    mock_request_cancel = mocker.patch(
+        "backend.executor.utils.wf_cancel.request_cancel"
+    )
+    mock_get_children = mocker.patch("backend.executor.utils._get_child_executions")
+
+    with pytest.raises(NotFoundError):
+        await stop_graph_execution(
+            user_id="not-the-owner",
+            graph_exec_id="someone-elses-exec",
+            wait_timeout=0,  # would skip the wait-loop ownership read
+            cascade=True,
+        )
+
+    # No cancel signal on either backend, and no cascade to children.
+    mock_queue_client.publish_message.assert_not_called()
+    mock_request_cancel.assert_not_called()
+    mock_get_children.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Credential validation error marker parity.
 #
@@ -1873,3 +1915,173 @@ async def test_add_graph_execution_bypass_paywall_skips_check(
         )
 
     paywall_mock.assert_not_called()
+
+
+# ── Item 1: _dispatch_via_workflows slot-release contract ─────────────────
+
+
+def _dispatch_mocks(mocker: MockerFixture, admission):
+    """Wire the workflows-path dependencies for a dispatch test and return the
+    ``release_run_slot`` spy. Dispatch is forced to raise so the except-branch
+    that decides whether to release runs."""
+    from types import SimpleNamespace
+
+    from backend.data.redis_helpers import SlotAdmission
+
+    mocker.patch(
+        "backend.workflows.rate_limit.acquire_run_slot",
+        new=mocker.AsyncMock(return_value=admission),
+    )
+    store = mocker.patch(
+        "backend.workflows.entry_store.store_execution_entry",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch(
+        "backend.workflows.client.dispatch_graph_execution",
+        new=mocker.AsyncMock(side_effect=RuntimeError("dispatch boom")),
+    )
+    release = mocker.patch(
+        "backend.workflows.rate_limit.release_run_slot",
+        new=mocker.AsyncMock(),
+    )
+    entry = SimpleNamespace(graph_exec_id="exec-1")
+    edb = SimpleNamespace(set_render_run_id=mocker.AsyncMock())
+    return SlotAdmission, store, release, entry, edb
+
+
+@pytest.mark.asyncio
+async def test_refreshed_slot_not_released_on_dispatch_failure(mocker: MockerFixture):
+    """A REFRESHED slot belongs to the still-running original run; a failed
+    dispatch must NOT release it — releasing would drop a slot that run still
+    depends on and under-count the user."""
+    from backend.data.redis_helpers import SlotAdmission
+    from backend.executor.utils import _dispatch_via_workflows
+
+    _, _, release, entry, edb = _dispatch_mocks(mocker, SlotAdmission.REFRESHED)
+
+    with pytest.raises(RuntimeError, match="dispatch boom"):
+        await _dispatch_via_workflows(entry, "user-1", edb)
+
+    release.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admitted_slot_released_on_dispatch_failure(mocker: MockerFixture):
+    """A newly ADMITTED slot is owned by this call; a failed dispatch MUST
+    release it so the reserved capacity isn't leaked."""
+    from backend.data.redis_helpers import SlotAdmission
+    from backend.executor.utils import _dispatch_via_workflows
+
+    _, _, release, entry, edb = _dispatch_mocks(mocker, SlotAdmission.ADMITTED)
+
+    with pytest.raises(RuntimeError, match="dispatch boom"):
+        await _dispatch_via_workflows(entry, "user-2", edb)
+
+    release.assert_awaited_once_with("user-2", "exec-1")
+
+
+@pytest.mark.asyncio
+async def test_rejected_slot_raises_rate_limit_and_never_dispatches(
+    mocker: MockerFixture,
+):
+    """REJECTED means the pool was full: raise the rate-limit error without
+    storing the entry, dispatching, or releasing."""
+    from backend.data.redis_helpers import SlotAdmission
+    from backend.executor.utils import _dispatch_via_workflows
+    from backend.workflows.rate_limit import ExecutionRateLimitError
+
+    _, store, release, entry, edb = _dispatch_mocks(mocker, SlotAdmission.REJECTED)
+
+    with pytest.raises(ExecutionRateLimitError):
+        await _dispatch_via_workflows(entry, "user-3", edb)
+
+    store.assert_not_called()
+    release.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_failure_cancels_run_and_keeps_slot(
+    mocker: MockerFixture,
+):
+    """If dispatch returns a run id but the subsequent set_render_run_id write
+    fails, the task is already RUNNING: the slot must NOT be released (that would
+    under-count the cap), and the orphaned run must be best-effort hard-cancelled
+    (its run id may never have been persisted for the normal stop path)."""
+    from types import SimpleNamespace
+
+    from backend.data.redis_helpers import SlotAdmission
+    from backend.executor.utils import _dispatch_via_workflows
+
+    mocker.patch(
+        "backend.workflows.rate_limit.acquire_run_slot",
+        new=mocker.AsyncMock(return_value=SlotAdmission.ADMITTED),
+    )
+    mocker.patch(
+        "backend.workflows.entry_store.store_execution_entry",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch(
+        "backend.workflows.client.dispatch_graph_execution",
+        new=mocker.AsyncMock(return_value="render-run-1"),
+    )
+    cancel_run = mocker.patch(
+        "backend.workflows.client.cancel_graph_execution_run",
+        new=mocker.AsyncMock(),
+    )
+    release = mocker.patch(
+        "backend.workflows.rate_limit.release_run_slot",
+        new=mocker.AsyncMock(),
+    )
+    entry = SimpleNamespace(graph_exec_id="exec-1")
+    edb = SimpleNamespace(
+        set_render_run_id=mocker.AsyncMock(side_effect=RuntimeError("db blip"))
+    )
+
+    with pytest.raises(RuntimeError, match="db blip"):
+        await _dispatch_via_workflows(entry, "user-1", edb)
+
+    cancel_run.assert_awaited_once_with("render-run-1")
+    release.assert_not_called()
+
+
+# ── Item 3: stop_graph_execution ownership check ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stop_graph_execution_rejects_unowned_before_cancel(
+    mocker: MockerFixture,
+):
+    """A caller passing a graph_exec_id it does not own must get NotFoundError
+    and no cancel signal must be emitted — even with wait_timeout=0, which
+    otherwise returns before the wait-loop's ownership-scoped read runs."""
+    from backend.executor.utils import stop_graph_execution
+    from backend.util.exceptions import NotFoundError
+
+    mocker.patch("backend.executor.utils.prisma").is_connected.return_value = False
+    mock_db = mocker.AsyncMock()
+    # Ownership-scoped lookup returns None → caller does not own this execution.
+    mock_db.get_graph_execution_meta = mocker.AsyncMock(return_value=None)
+    mocker.patch(
+        "backend.executor.utils.get_database_manager_async_client",
+        return_value=mock_db,
+    )
+    mocker.patch("backend.executor.utils.config").execution_backend = "workflows"
+    request_cancel = mocker.patch(
+        "backend.workflows.cancel.request_cancel", new=mocker.AsyncMock()
+    )
+    get_child = mocker.patch("backend.executor.utils._get_child_executions")
+
+    with pytest.raises(NotFoundError):
+        await stop_graph_execution(
+            user_id="other-user",
+            graph_exec_id="not-owned",
+            wait_timeout=0,
+            cascade=False,
+        )
+
+    mock_db.get_graph_execution_meta.assert_awaited_once_with(
+        execution_id="not-owned", user_id="other-user"
+    )
+    request_cancel.assert_not_called()
+    # Authorization happens before any cascade lookup.
+    get_child.assert_not_called()
