@@ -249,8 +249,8 @@ Phase 1 — at apply, values you already control:
 
 - Frontend URL keys — enter a valid `https://` placeholder (e.g. `https://example.com`); an
   empty or malformed value fails validation at boot
-(SMTP is not entered here — signups self-confirm by default. See
-[Require email verification](#require-email-verification) to turn it on.)
+  (SMTP is not entered here — signups self-confirm by default. See
+  [Require email verification](#require-email-verification) to turn it on.)
 
 Phase 2 — after the first apply, values that need the `*.onrender.com` hostnames:
 
@@ -285,13 +285,6 @@ prompt (see [URL config layer](#url-config-layer)). Not prompted either: `PLATFO
 GoTrue's `GOTRUE_SITE_URL` / `API_EXTERNAL_URL`, and every consumer's
 `FRONTEND_BASE_URL` / `JWT_VERIFY_KEY` (all derived or pulled via `fromService`).
 
-> **GoTrue env-var naming gotcha.** Most GoTrue settings take a `GOTRUE_` prefix, but a
-> few keys are read **unprefixed** — most importantly `API_EXTERNAL_URL` (GoTrue binds it
-> via an explicit `envconfig:"API_EXTERNAL_URL"` tag that overrides the prefix). Setting
-> `GOTRUE_API_EXTERNAL_URL` is silently ignored and the service fails to boot with
-> `required key API_EXTERNAL_URL missing value`. The blueprint uses the correct unprefixed
-> key; keep it that way if you edit it.
-
 The authoritative source is [`render.yaml`](render.yaml) — each `sync: false` entry carries a
 `# DEPLOYER:` comment and Render prompts for it at deploy. Local development doesn't use this
 table; it runs from `.env.default` files via `make init-env` (see [`local.md`](local.md#environment-files)).
@@ -306,14 +299,14 @@ relay (Render has no managed email) and flip the flag:
 1. Open the **gotrue** service → **Environment** tab.
 2. Add the six SMTP keys (values from your provider, e.g. Resend, Postmark, SendGrid, Mailgun):
 
-   | Key                      | Example value                    |
-   | ------------------------ | -------------------------------- |
-   | `GOTRUE_SMTP_HOST`       | `smtp.resend.com`                |
-   | `GOTRUE_SMTP_PORT`       | `465` (SSL) or `587` (STARTTLS)  |
-   | `GOTRUE_SMTP_USER`       | provider username / API-key name |
-   | `GOTRUE_SMTP_PASS`       | provider password / API key      |
-   | `GOTRUE_SMTP_SENDER_NAME`| `AutoGPT Platform`               |
-   | `GOTRUE_SMTP_ADMIN_EMAIL`| a verified sender, e.g. `noreply@yourdomain.com` |
+   | Key                       | Example value                                    |
+   | ------------------------- | ------------------------------------------------ |
+   | `GOTRUE_SMTP_HOST`        | `smtp.resend.com`                                |
+   | `GOTRUE_SMTP_PORT`        | `465` (SSL) or `587` (STARTTLS)                  |
+   | `GOTRUE_SMTP_USER`        | provider username / API-key name                 |
+   | `GOTRUE_SMTP_PASS`        | provider password / API key                      |
+   | `GOTRUE_SMTP_SENDER_NAME` | `AutoGPT Platform`                               |
+   | `GOTRUE_SMTP_ADMIN_EMAIL` | a verified sender, e.g. `noreply@yourdomain.com` |
 
 3. Set `GOTRUE_MAILER_AUTOCONFIRM=false`.
 4. **Save changes** — Render redeploys gotrue automatically.
@@ -332,12 +325,12 @@ after deploy:
    `https://<gotrue host>.onrender.com/auth/v1/callback`.
 2. On the **gotrue** service → **Environment** tab, add:
 
-   | Key                                  | Value                                                          |
-   | ------------------------------------ | -------------------------------------------------------------- |
-   | `GOTRUE_EXTERNAL_GOOGLE_ENABLED`     | `true`                                                         |
-   | `GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID`   | Client ID from Google                                          |
-   | `GOTRUE_EXTERNAL_GOOGLE_SECRET`      | Client secret from Google                                      |
-   | `GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI`| `https://<gotrue host>.onrender.com/auth/v1/callback`          |
+   | Key                                   | Value                                                 |
+   | ------------------------------------- | ----------------------------------------------------- |
+   | `GOTRUE_EXTERNAL_GOOGLE_ENABLED`      | `true`                                                |
+   | `GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID`    | Client ID from Google                                 |
+   | `GOTRUE_EXTERNAL_GOOGLE_SECRET`       | Client secret from Google                             |
+   | `GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI` | `https://<gotrue host>.onrender.com/auth/v1/callback` |
 
 3. Ensure the callback URL is also in `GOTRUE_URI_ALLOW_LIST`.
 4. **Save changes** — gotrue redeploys with Google login enabled.
