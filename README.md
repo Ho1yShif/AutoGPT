@@ -144,7 +144,9 @@ Phase 1 — at apply, values you already control:
 
 - Frontend URL keys — enter a valid `https://` placeholder (e.g. `https://example.com`); an
   empty or malformed value fails validation at boot
-- `GOTRUE_SMTP_*` — optional; only fill in if you have SMTP
+- `GOTRUE_SMTP_*` — **required** unless you run the no-SMTP demo. With the blueprint default
+  `GOTRUE_MAILER_AUTOCONFIRM=false`, signups must confirm via email, so GoTrue needs a working
+  SMTP relay or new users stall at the confirmation step. See [Entering SMTP credentials](#entering-smtp-credentials)
 
 Phase 2 — after the first apply, values that need the `*.onrender.com` hostnames:
 
@@ -167,8 +169,10 @@ Full list of per-service prompts:
 | `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend   | `wss://<websocket-server host>/ws` (build-time)                               |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY`  | frontend   | Anon JWT signed with `JWT_VERIFY_KEY` (see [below](#generating-the-anon-key)) |
 | `GOTRUE_URI_ALLOW_LIST`          | gotrue     | Allowed redirect URLs (e.g. `https://<frontend>/**`)                          |
-| `GOTRUE_SMTP_*`                  | gotrue     | SMTP host/port/user/pass/sender/admin                                         |
-| `GOTRUE_EXTERNAL_GOOGLE_*`       | gotrue     | Optional Google OAuth (leave `ENABLED=false` to skip)                         |
+| `GOTRUE_SMTP_*`                  | gotrue     | SMTP host/port/user/pass/sender/admin — required unless you run the no-SMTP demo (see below) |
+
+Google OAuth is no longer a blueprint prompt (it's optional and off by default). To turn it
+on after deploy, see [Enable Google login](#enable-google-login).
 
 `FRONTEND_BASE_URL` is not in this table — it's a placeholder `value:` on rest-server, not a
 prompt (see [URL config layer](#url-config-layer)). Not prompted either: `PLATFORM_BASE_URL`,
@@ -179,6 +183,53 @@ GoTrue's `GOTRUE_SITE_URL` / `GOTRUE_API_EXTERNAL_URL`, and every consumer's
 The authoritative source is [`render.yaml`](render.yaml) — each `sync: false` entry carries a
 `# DEPLOYER:` comment and Render prompts for it at deploy. Local development doesn't use this
 table; it runs from `.env.default` files via `make init-env` (see [`local.md`](local.md#environment-files)).
+
+#### Entering SMTP credentials
+
+GoTrue sends signup confirmation and password-reset emails through your own SMTP relay (Render
+has no managed email). Enter these six keys on the **gotrue** service — either at apply (they
+appear as prompts) or afterward in the Dashboard:
+
+1. Open the **gotrue** service → **Environment** tab.
+2. Set each key (values from your SMTP provider, e.g. Resend, Postmark, SendGrid, Mailgun):
+
+   | Key                      | Example value                    |
+   | ------------------------ | -------------------------------- |
+   | `GOTRUE_SMTP_HOST`       | `smtp.resend.com`                |
+   | `GOTRUE_SMTP_PORT`       | `465` (SSL) or `587` (STARTTLS)  |
+   | `GOTRUE_SMTP_USER`       | provider username / API-key name |
+   | `GOTRUE_SMTP_PASS`       | provider password / API key      |
+   | `GOTRUE_SMTP_SENDER_NAME`| `AutoGPT Platform`               |
+   | `GOTRUE_SMTP_ADMIN_EMAIL`| a verified sender, e.g. `noreply@yourdomain.com` |
+
+3. **Save changes** — Render redeploys gotrue automatically.
+
+The sender address (`GOTRUE_SMTP_ADMIN_EMAIL`) must be a domain/address your SMTP provider has
+verified, or delivery is rejected.
+
+No SMTP relay? For a throwaway demo only, set `GOTRUE_MAILER_AUTOCONFIRM=true` on gotrue to
+auto-confirm signups and skip email entirely. Don't use this in production — anyone can register
+with an unverified address.
+
+#### Enable Google login
+
+Google OAuth is optional and off by default, so it's not a blueprint prompt. To turn it on
+after deploy:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an
+   **OAuth 2.0 Client ID** (type: Web application). Add authorized redirect URI
+   `https://<gotrue host>.onrender.com/auth/v1/callback`.
+2. On the **gotrue** service → **Environment** tab, add:
+
+   | Key                                  | Value                                                          |
+   | ------------------------------------ | -------------------------------------------------------------- |
+   | `GOTRUE_EXTERNAL_GOOGLE_ENABLED`     | `true`                                                         |
+   | `GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID`   | Client ID from Google                                          |
+   | `GOTRUE_EXTERNAL_GOOGLE_SECRET`      | Client secret from Google                                      |
+   | `GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI`| `https://<gotrue host>.onrender.com/auth/v1/callback`          |
+
+3. Ensure the callback URL is also in `GOTRUE_URI_ALLOW_LIST`.
+4. **Save changes** — gotrue redeploys with Google login enabled.
 
 #### Generating the anon key
 
@@ -228,7 +279,8 @@ Follow the buckets from [Secrets & environment setup](#secrets--environment-setu
    `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
    [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
 4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
-   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs, SMTP if any; leave optional GoTrue keys blank.
+   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs, and your
+   [SMTP credentials](#entering-smtp-credentials) (or plan to run the no-SMTP demo).
 5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
    and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
 6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
