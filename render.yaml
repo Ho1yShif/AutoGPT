@@ -133,8 +133,14 @@ projects:
               - key: GOTRUE_API_PORT
                 value: "10000"           # equals Render's default PORT; rewrite
                                          # target = autogpt-platform-gotrue:10000
+              # Frontend public origin (F). GoTrue is a pserv (no RENDER_EXTERNAL_URL),
+              # so it pulls the single FRONTEND_BASE_URL keyname from rest-server
+              # (the owner) — same wire as GOTRUE_JWT_SECRET below. No extra prompt.
               - key: GOTRUE_API_EXTERNAL_URL
-                sync: false              # DEPLOYER: frontend public origin
+                fromService:
+                  name: rest-server
+                  type: web
+                  envVarKey: FRONTEND_BASE_URL
               # --- Database (owns the `auth` schema; NO ?schema=platform) ---
               - key: GOTRUE_DB_DRIVER
                 value: postgres
@@ -159,10 +165,17 @@ projects:
               - key: GOTRUE_JWT_EXP
                 value: "3600"
               # --- Signup / providers (template-safe defaults) --------------
+              # Frontend public origin (F) again — pulled from rest-server, not
+              # re-prompted. (See GOTRUE_API_EXTERNAL_URL above.)
               - key: GOTRUE_SITE_URL
-                sync: false              # DEPLOYER: frontend public origin
+                fromService:
+                  name: rest-server
+                  type: web
+                  envVarKey: FRONTEND_BASE_URL
+              # Redirect allow-list — stays deployer-supplied: it can carry
+              # callback paths / wildcards, so it is not a clean single origin.
               - key: GOTRUE_URI_ALLOW_LIST
-                sync: false              # DEPLOYER: allowed redirect URLs
+                sync: false              # DEPLOYER: allowed redirect URLs (e.g. https://<frontend>/**)
               - key: GOTRUE_DISABLE_SIGNUP
                 value: "false"
               - key: GOTRUE_EXTERNAL_EMAIL_ENABLED
@@ -304,12 +317,17 @@ projects:
               - key: JWT_SIGN_ALGORITHM
                 value: HS256
               # ENCRYPTION_KEY: Fernet cipher key for stored credentials.
-              # sync:false (deployer-supplied) NOT generateValue — Render's
+              # rest-server OWNS it: a single deployer-supplied (sync:false) value.
+              # ws / scheduler / database-manager pull THIS value via
+              # `fromService envVarKey: ENCRYPTION_KEY`, so the deployer enters it
+              # ONCE (no 4x paste, no mismatch risk). NOT generateValue — Render's
               # generated secret is not guaranteed to be a valid url-safe-base64
-              # Fernet key. MUST be the IDENTICAL value on every backend service
-              # + the executor Workflow. Generate one, paste everywhere; each
-              # service logs a non-secret fingerprint at boot to spot mismatches.
-              # See README.
+              # Fernet key. NOT in the shared group — sync:false is ignored inside
+              # groups and a literal group value is clobbered on every re-sync
+              # (which would make stored creds undecryptable). The manual executor
+              # Workflow is outside this Blueprint, so it MUST get the same value
+              # pasted by hand. Each service logs a non-secret fingerprint at boot
+              # to spot mismatches. See README.
               - key: ENCRYPTION_KEY
                 sync: false
               # --- URLs / CORS / env --------------------------------------
@@ -383,8 +401,10 @@ projects:
               # owner); dockerCommand derives BACKEND_CORS_ALLOW_ORIGINS from it.
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
+              # Pull rest-server's single deployer-supplied ENCRYPTION_KEY (owner)
+              # so the Fernet key is guaranteed identical without a second paste.
               - key: ENCRYPTION_KEY
-                sync: false             # IDENTICAL to rest-server (see rest-server note)
+                fromService: { name: rest-server, type: web, envVarKey: ENCRYPTION_KEY }
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -452,8 +472,10 @@ projects:
               # keyname from rest-server (the owner).
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
+              # Pull rest-server's single deployer-supplied ENCRYPTION_KEY (owner)
+              # so the Fernet key is guaranteed identical without a second paste.
               - key: ENCRYPTION_KEY
-                sync: false             # IDENTICAL to rest-server (see rest-server note)
+                fromService: { name: rest-server, type: web, envVarKey: ENCRYPTION_KEY }
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -508,8 +530,10 @@ projects:
               # single keyname from rest-server (the owner).
               - key: FRONTEND_BASE_URL
                 fromService: { name: rest-server, type: web, envVarKey: FRONTEND_BASE_URL }
+              # Pull rest-server's single deployer-supplied ENCRYPTION_KEY (owner)
+              # so the Fernet key is guaranteed identical without a second paste.
               - key: ENCRYPTION_KEY
-                sync: false             # IDENTICAL to rest-server (see rest-server note)
+                fromService: { name: rest-server, type: web, envVarKey: ENCRYPTION_KEY }
               - fromGroup: autogpt-platform-secrets
 
           # ----------------------------------------------------------------
@@ -584,9 +608,13 @@ projects:
 # resolvable in Blueprints. It is a SERVICE-LEVEL generateValue on rest-server
 # (the owner) instead. See the rest-server JWT note above.
 # NOTE: ENCRYPTION_KEY is deliberately NOT in this group. It must be a valid
-# url-safe-base64 Fernet key, which generateValue does not guarantee, and
-# sync:false is ignored inside groups — so it is set per-service as sync:false
-# (deployer-supplied). See the rest-server note above and the README.
+# url-safe-base64 Fernet key, which generateValue does not guarantee, and both
+# a literal group value (clobbered on re-sync) and sync:false (ignored inside
+# groups) are unusable for a deployer-supplied secret in a group. Instead it is
+# a single sync:false value on rest-server (the owner); ws / scheduler /
+# database-manager pull it via `fromService envVarKey: ENCRYPTION_KEY`, so the
+# deployer enters it ONCE. Same pattern as JWT_VERIFY_KEY and FRONTEND_BASE_URL.
+# See the rest-server note above and the README.
 # ==========================================================================
 envVarGroups:
   - name: autogpt-platform-secrets
