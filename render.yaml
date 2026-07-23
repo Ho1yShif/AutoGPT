@@ -175,25 +175,14 @@ projects:
             rootDir: .
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
-            # App reads AGENT_API_PORT (not $PORT). Wrap DB URLs with ?schema=
-            # (Render can't interpolate env in YAML) and DERIVE:
-            #   PLATFORM_BASE_URL       <- RENDER_EXTERNAL_URL (this service)
-            #   BACKEND_CORS_ALLOW_ORIGINS <- [FRONTEND_BASE_URL]
-            # ${VAR:-...} lets a Dashboard override win (custom domains).
-            dockerCommand: >-
-              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
-              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              export PLATFORM_BASE_URL="${PLATFORM_BASE_URL:-$RENDER_EXTERNAL_URL}";
-              export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
-              exec env AGENT_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/rest
+            # Startup logic (schema wrap, PLATFORM_BASE_URL + CORS derivation,
+            # exec) lives in render/entrypoint.sh — Render's dockerCommand runs a
+            # single command, not a multi-statement shell script.
+            dockerCommand: /app/autogpt_platform/backend/render/entrypoint.sh rest
             healthCheckPath: /health
-            # Prisma resolves both url=DATABASE_URL and directUrl=DIRECT_URL at
-            # schema load, so both must be exported here too (else first deploy
-            # fails with "Environment variable not found: DATABASE_URL").
-            preDeployCommand: >-
-              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
-              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              /app/autogpt_platform/backend/.venv/bin/prisma migrate deploy
+            # SOLE owner of `prisma migrate deploy` (inv #3). The migrate role
+            # exports DATABASE_URL + DIRECT_URL before running Prisma.
+            preDeployCommand: /app/autogpt_platform/backend/render/entrypoint.sh migrate
             envVars:
               # Postgres
               - key: RENDER_DATABASE_URL
@@ -278,12 +267,8 @@ projects:
             rootDir: .
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
-            # Derive CORS from FRONTEND_BASE_URL (pulled from rest-server below).
-            dockerCommand: >-
-              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
-              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              export BACKEND_CORS_ALLOW_ORIGINS="[\"$FRONTEND_BASE_URL\"]";
-              exec env WEBSOCKET_SERVER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/ws
+            # entrypoint.sh derives CORS from FRONTEND_BASE_URL (from rest-server).
+            dockerCommand: /app/autogpt_platform/backend/render/entrypoint.sh ws
             healthCheckPath: /health
             envVars:
               - key: RENDER_DATABASE_URL
@@ -330,10 +315,7 @@ projects:
             rootDir: .
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
-            dockerCommand: >-
-              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
-              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              exec env EXECUTION_SCHEDULER_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/scheduler
+            dockerCommand: /app/autogpt_platform/backend/render/entrypoint.sh scheduler
             # NOTE: pserv can't declare healthCheckPath in a Blueprint. Serves
             # /health_check on its RPC port; set it in the Dashboard if desired.
             envVars:
@@ -387,10 +369,7 @@ projects:
             rootDir: .
             dockerContext: .
             dockerfilePath: autogpt_platform/backend/Dockerfile
-            dockerCommand: >-
-              export DATABASE_URL="$RENDER_DATABASE_URL?schema=platform";
-              export DIRECT_URL="$RENDER_DIRECT_URL?schema=platform";
-              exec env DATABASE_API_PORT=$PORT /app/autogpt_platform/backend/.venv/bin/db
+            dockerCommand: /app/autogpt_platform/backend/render/entrypoint.sh db
             # NOTE: pserv can't declare healthCheckPath in a Blueprint.
             envVars:
               - key: PYRO_HOST

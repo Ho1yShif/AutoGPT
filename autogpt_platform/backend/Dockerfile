@@ -157,6 +157,8 @@ COPY autogpt_platform/backend/poetry.lock autogpt_platform/backend/pyproject.tom
 # Copy backend code + docs (for Copilot docs search)
 COPY autogpt_platform/backend ./
 COPY docs /app/docs
+# Render start/migrate entrypoint (dispatches on role: rest|ws|scheduler|db|migrate)
+RUN chmod +x /app/autogpt_platform/backend/render/entrypoint.sh
 # Install the project package to create entry point scripts in .venv/bin/
 # (e.g., rest, executor, ws, db, scheduler, notification - see [tool.poetry.scripts])
 RUN POETRY_VIRTUALENVS_CREATE=true POETRY_VIRTUALENVS_IN_PROJECT=true \
