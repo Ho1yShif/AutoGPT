@@ -146,7 +146,8 @@ projects:
               - key: GOTRUE_EXTERNAL_PHONE_ENABLED
                 value: "false"
               - key: GOTRUE_MAILER_AUTOCONFIRM
-                value: "false"          # set "true" only for a no-SMTP demo
+                value: "true"           # signups self-confirm (no SMTP). Set "false"
+                                        # + add GOTRUE_SMTP_* to require email verification.
               - key: GOTRUE_MAILER_URLPATHS_INVITE
                 value: /auth/v1/verify
               - key: GOTRUE_MAILER_URLPATHS_CONFIRMATION
@@ -155,28 +156,14 @@ projects:
                 value: /auth/v1/verify
               - key: GOTRUE_MAILER_URLPATHS_EMAIL_CHANGE
                 value: /auth/v1/verify
-              # SMTP — DEPLOYER-supplied (Render has no managed email).
-              - key: GOTRUE_SMTP_HOST
-                sync: false
-              - key: GOTRUE_SMTP_PORT
-                sync: false
-              - key: GOTRUE_SMTP_USER
-                sync: false
-              - key: GOTRUE_SMTP_PASS
-                sync: false
-              - key: GOTRUE_SMTP_SENDER_NAME
-                sync: false
-              - key: GOTRUE_SMTP_ADMIN_EMAIL
-                sync: false
-              # Google OAuth — DEPLOYER-supplied (optional).
-              - key: GOTRUE_EXTERNAL_GOOGLE_ENABLED
-                sync: false
-              - key: GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID
-                sync: false
-              - key: GOTRUE_EXTERNAL_GOOGLE_SECRET
-                sync: false
-              - key: GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI
-                sync: false
+              # SMTP is OPTIONAL — the default GOTRUE_MAILER_AUTOCONFIRM=true means
+              # signups self-confirm without email. To require email verification,
+              # add GOTRUE_SMTP_* in the gotrue service's Environment tab and set
+              # AUTOCONFIRM=false — see the README "Require email verification" section.
+              #
+              # Google OAuth is OPTIONAL and disabled by default. To enable it,
+              # add GOTRUE_EXTERNAL_GOOGLE_* in the gotrue service's Environment
+              # tab after deploy — see the README "Enable Google login" section.
 
           # rest-server — public API (FastAPI). SOLE owner of
           # `prisma migrate deploy` (preDeployCommand).

@@ -65,11 +65,97 @@ declare Workflows yet); the backend reaches it via `RENDER_WORKFLOW_SLUG`.
 
 ---
 
+## Deploy
+
+These are the click-by-click steps. Each one links into
+**[Secrets & environment setup](#secrets--environment-setup)** below — the reference for what
+every value is, where it lives, and how to generate it. Keep that section open alongside these
+steps; the tables there are the source of truth.
+
+> **The two things to prepare first:** the [executor Workflow](#manual-step--the-executor-workflow)
+> (created by hand — the Blueprint needs its slug) and the
+> [`autogpt-platform-deploy-secrets` env group](#deployer-supplied-keys-bucket-3) (created before
+> you apply). Everything else is entered in the Blueprint prompts or after the first apply.
+
+1. Fork this repo and push it to your GitHub/GitLab account.
+2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
+   its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
+3. Create the `autogpt-platform-deploy-secrets` env group (Dashboard → Env Groups → New) with
+   `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
+   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
+4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
+   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs and the anon key.
+   (No SMTP needed — signups self-confirm by default.)
+5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
+   and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
+6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
+   redeploy the frontend and rest-server, then gotrue, ws, scheduler, and database-manager. See
+   [per-service prompts](#per-service-prompts-bucket-4).
+7. Finish the executor Workflow ([part B](#manual-step--the-executor-workflow)): now that
+   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env and deploy for real.
+8. Create the `autogpt-platform-llm` env group — see
+   [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
+
+Optional, after the app is up: [require email verification](#require-email-verification) (SMTP)
+and [enable Google login](#enable-google-login) — both off by default.
+
+### Manual step — the executor Workflow
+
+The executor is a Render Workflow, which Blueprints can't declare. The Blueprint needs its
+slug and it needs the Blueprint's Postgres / Key Value / `JWT_VERIFY_KEY`, so it's created in
+two parts around the apply.
+
+Part A — create the shell (before the apply, step 3):
+
+1. New → Workflow, link this repo, same workspace + region.
+2. Set Root Directory `autogpt_platform/backend`, Build Command
+   `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`, Start Command
+   `poetry run python -m backend.workflows.main`.
+3. Create it and copy its slug (task id shows as `{slug}/run_graph_execution`). Its first
+   deploy fails — Postgres/Redis/`JWT_VERIFY_KEY` don't exist yet. Expected; you only need the
+   slug for the Blueprint prompt (step 4).
+
+Part B — finish it (after the apply, step 7):
+
+4. Give it the same wiring as the backend: `DATABASE_URL` + `DIRECT_URL` with
+   `?schema=platform`, `REDIS_URL` (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
+   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY` (copy from rest-server),
+   the same `ENCRYPTION_KEY` as rest-server (confirm the boot fingerprint matches), plus any
+   provider API keys your graphs use.
+5. Deploy for real. It should boot; graph execution works end-to-end.
+
+### Manual step — LLM / Claude API keys
+
+Two features need an LLM credential: copilot chat (`/api/chat/*`, on rest-server) and the AI
+blocks (AI Text Generator, `claude_code`, `orchestrator`, on the executor Workflow). The
+deploy succeeds with no key set — these features just return nothing until one is present.
+
+Because `sync: false` is invalid in env groups and the Workflow isn't a Blueprint resource,
+these keys aren't in `render.yaml`. Use one Dashboard env group read by both consumers:
+
+1. Create the env group: Dashboard → Env Groups → New → `autogpt-platform-llm`. Don't add it
+   to `render.yaml`.
+2. Add the keys for one transport:
+
+   | Transport                         | Env to set                                                                                     | Render?                          |
+   | --------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------- |
+   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`)                         | ✅                               |
+   | Direct Anthropic                  | `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅                               |
+   | Subscription (`claude login`)     | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true`                                                       | ⚠️ advanced/dev only (see Notes) |
+
+   Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
+   fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
+
+3. Link the group to both consumers — rest-server (copilot chat) and the executor Workflow
+   (AI blocks): Environment → Link Environment Group → `autogpt-platform-llm` → save & redeploy.
+   Sharing the group means each key is entered once.
+
+---
+
 ## Secrets & environment setup
 
-Work through this section before deploying — it's what you actually configure, not just
-reference. Every environment value falls into one of five buckets, which tells you where it
-lives and when you set it:
+This is the reference behind the [Deploy](#deploy) steps above — what each value is, where it
+lives, and when you set it. Every environment value falls into one of five buckets:
 
 | #   | Bucket                                           | Where                   | Who sets it                | When                                 |
 | --- | ------------------------------------------------ | ----------------------- | -------------------------- | ------------------------------------ |
@@ -144,7 +230,8 @@ Phase 1 — at apply, values you already control:
 
 - Frontend URL keys — enter a valid `https://` placeholder (e.g. `https://example.com`); an
   empty or malformed value fails validation at boot
-- `GOTRUE_SMTP_*` — optional; only fill in if you have SMTP
+(SMTP is not entered here — signups self-confirm by default. See
+[Require email verification](#require-email-verification) to turn it on.)
 
 Phase 2 — after the first apply, values that need the `*.onrender.com` hostnames:
 
@@ -167,8 +254,11 @@ Full list of per-service prompts:
 | `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend   | `wss://<websocket-server host>/ws` (build-time)                               |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY`  | frontend   | Anon JWT signed with `JWT_VERIFY_KEY` (see [below](#generating-the-anon-key)) |
 | `GOTRUE_URI_ALLOW_LIST`          | gotrue     | Allowed redirect URLs (e.g. `https://<frontend>/**`)                          |
-| `GOTRUE_SMTP_*`                  | gotrue     | SMTP host/port/user/pass/sender/admin                                         |
-| `GOTRUE_EXTERNAL_GOOGLE_*`       | gotrue     | Optional Google OAuth (leave `ENABLED=false` to skip)                         |
+
+Two GoTrue features are optional and off by default, so they aren't blueprint prompts —
+turn them on after deploy if you want them:
+[Require email verification](#require-email-verification) (SMTP) and
+[Enable Google login](#enable-google-login) (OAuth).
 
 `FRONTEND_BASE_URL` is not in this table — it's a placeholder `value:` on rest-server, not a
 prompt (see [URL config layer](#url-config-layer)). Not prompted either: `PLATFORM_BASE_URL`,
@@ -179,6 +269,52 @@ GoTrue's `GOTRUE_SITE_URL` / `GOTRUE_API_EXTERNAL_URL`, and every consumer's
 The authoritative source is [`render.yaml`](render.yaml) — each `sync: false` entry carries a
 `# DEPLOYER:` comment and Render prompts for it at deploy. Local development doesn't use this
 table; it runs from `.env.default` files via `make init-env` (see [`local.md`](local.md#environment-files)).
+
+#### Require email verification
+
+By default the blueprint sets `GOTRUE_MAILER_AUTOCONFIRM=true`, so signups self-confirm and the
+app works with no email setup. The tradeoff: anyone can register with an address they don't own,
+and password reset (which needs email) won't work. To require verified emails, add your own SMTP
+relay (Render has no managed email) and flip the flag:
+
+1. Open the **gotrue** service → **Environment** tab.
+2. Add the six SMTP keys (values from your provider, e.g. Resend, Postmark, SendGrid, Mailgun):
+
+   | Key                      | Example value                    |
+   | ------------------------ | -------------------------------- |
+   | `GOTRUE_SMTP_HOST`       | `smtp.resend.com`                |
+   | `GOTRUE_SMTP_PORT`       | `465` (SSL) or `587` (STARTTLS)  |
+   | `GOTRUE_SMTP_USER`       | provider username / API-key name |
+   | `GOTRUE_SMTP_PASS`       | provider password / API key      |
+   | `GOTRUE_SMTP_SENDER_NAME`| `AutoGPT Platform`               |
+   | `GOTRUE_SMTP_ADMIN_EMAIL`| a verified sender, e.g. `noreply@yourdomain.com` |
+
+3. Set `GOTRUE_MAILER_AUTOCONFIRM=false`.
+4. **Save changes** — Render redeploys gotrue automatically.
+
+The sender address (`GOTRUE_SMTP_ADMIN_EMAIL`) must be a domain/address your SMTP provider has
+verified, or delivery is rejected. Once `AUTOCONFIRM=false` is live, new signups stall until they
+click the emailed link — so confirm SMTP works before flipping it.
+
+#### Enable Google login
+
+Google OAuth is optional and off by default, so it's not a blueprint prompt. To turn it on
+after deploy:
+
+1. In [Google Cloud Console](https://console.cloud.google.com/apis/credentials), create an
+   **OAuth 2.0 Client ID** (type: Web application). Add authorized redirect URI
+   `https://<gotrue host>.onrender.com/auth/v1/callback`.
+2. On the **gotrue** service → **Environment** tab, add:
+
+   | Key                                  | Value                                                          |
+   | ------------------------------------ | -------------------------------------------------------------- |
+   | `GOTRUE_EXTERNAL_GOOGLE_ENABLED`     | `true`                                                         |
+   | `GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID`   | Client ID from Google                                          |
+   | `GOTRUE_EXTERNAL_GOOGLE_SECRET`      | Client secret from Google                                      |
+   | `GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI`| `https://<gotrue host>.onrender.com/auth/v1/callback`          |
+
+3. Ensure the callback URL is also in `GOTRUE_URI_ALLOW_LIST`.
+4. **Save changes** — gotrue redeploys with Google login enabled.
 
 #### Generating the anon key
 
@@ -217,85 +353,10 @@ means decryption fails. A malformed key fails fast at startup, not as a runtime 
 
 ---
 
-## Deploy
-
-Follow the buckets from [Secrets & environment setup](#secrets--environment-setup) in order:
-
-1. Fork this repo and push it to your GitHub/GitLab account.
-2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
-   its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
-3. Create the `autogpt-platform-deploy-secrets` env group (Dashboard → Env Groups → New) with
-   `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
-   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
-4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
-   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs, SMTP if any; leave optional GoTrue keys blank.
-5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
-   and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
-6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
-   redeploy the frontend and rest-server, then gotrue, ws, scheduler, and database-manager. See
-   [per-service prompts](#per-service-prompts-bucket-4).
-7. Finish the executor Workflow ([part B](#manual-step--the-executor-workflow)): now that
-   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env and deploy for real.
-8. Create the `autogpt-platform-llm` env group — see
-   [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
-
-### Manual step — the executor Workflow
-
-The executor is a Render Workflow, which Blueprints can't declare. The Blueprint needs its
-slug and it needs the Blueprint's Postgres / Key Value / `JWT_VERIFY_KEY`, so it's created in
-two parts around the apply.
-
-Part A — create the shell (before the apply, step 3):
-
-1. New → Workflow, link this repo, same workspace + region.
-2. Set Root Directory `autogpt_platform/backend`, Build Command
-   `poetry install && poetry run pip install --no-deps render_sdk==0.7.0`, Start Command
-   `poetry run python -m backend.workflows.main`.
-3. Create it and copy its slug (task id shows as `{slug}/run_graph_execution`). Its first
-   deploy fails — Postgres/Redis/`JWT_VERIFY_KEY` don't exist yet. Expected; you only need the
-   slug for the Blueprint prompt (step 4).
-
-Part B — finish it (after the apply, step 7):
-
-4. Give it the same wiring as the backend: `DATABASE_URL` + `DIRECT_URL` with
-   `?schema=platform`, `REDIS_URL` (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
-   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY` (copy from rest-server),
-   the same `ENCRYPTION_KEY` as rest-server (confirm the boot fingerprint matches), plus any
-   provider API keys your graphs use.
-5. Deploy for real. It should boot; graph execution works end-to-end.
-
-### Manual step — LLM / Claude API keys
-
-Two features need an LLM credential: copilot chat (`/api/chat/*`, on rest-server) and the AI
-blocks (AI Text Generator, `claude_code`, `orchestrator`, on the executor Workflow). The
-deploy succeeds with no key set — these features just return nothing until one is present.
-
-Because `sync: false` is invalid in env groups and the Workflow isn't a Blueprint resource,
-these keys aren't in `render.yaml`. Use one Dashboard env group read by both consumers:
-
-1. Create the env group: Dashboard → Env Groups → New → `autogpt-platform-llm`. Don't add it
-   to `render.yaml`.
-2. Add the keys for one transport:
-
-   | Transport                         | Env to set                                                                                     | Render?                          |
-   | --------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------- |
-   | OpenRouter (default, recommended) | `OPEN_ROUTER_API_KEY=<key>` (leave `CHAT_USE_OPENROUTER` unset/`true`)                         | ✅                               |
-   | Direct Anthropic                  | `ANTHROPIC_API_KEY=<key>` and `CHAT_USE_OPENROUTER=false` (or `CHAT_DIRECT_ANTHROPIC_API_KEY`) | ✅                               |
-   | Subscription (`claude login`)     | `CHAT_USE_CLAUDE_CODE_SUBSCRIPTION=true`                                                       | ⚠️ advanced/dev only (see Notes) |
-
-   Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
-   fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
-
-3. Link the group to both consumers — rest-server (copilot chat) and the executor Workflow
-   (AI blocks): Environment → Link Environment Group → `autogpt-platform-llm` → save & redeploy.
-   Sharing the group means each key is entered once.
-
----
-
 ## Using the app
 
-1. Open the frontend URL and **sign up**. GoTrue sends confirmation email via your SMTP
-   (or set `GOTRUE_MAILER_AUTOCONFIRM=true` on gotrue for a no-SMTP demo).
+1. Open the frontend URL and **sign up**. Signups self-confirm by default (no email needed); if
+   you've turned on [email verification](#require-email-verification), confirm via the emailed link.
 2. Log in, open the **Builder**, and create or import an agent graph.
 3. **Run** the agent — `rest-server` dispatches to the executor Workflow via
    `start_task`; progress streams back over the websocket-server.
