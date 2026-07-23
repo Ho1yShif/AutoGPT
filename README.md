@@ -6,7 +6,7 @@ from a single `render.yaml` Blueprint. Managed Postgres and Key Value replace Su
 Redis, self-hosted GoTrue handles auth, ClamAV scans uploads, and Render Workflows run the
 executor. No managed RabbitMQ, no managed Supabase, no hardcoded hosts.
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Significant-Gravitas/AutoGPT)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Ho1yShif/AutoGPT)
 
 ---
 
@@ -71,13 +71,13 @@ Work through this section before deploying — it's what you actually configure,
 reference. Every environment value falls into one of five buckets, which tells you where it
 lives and when you set it:
 
-| #   | Bucket                                           | Where                      | Who sets it                | When                                 |
-| --- | ------------------------------------------------ | -------------------------- | -------------------------- | ------------------------------------ |
-| 1   | Automatic wires (`fromDatabase` / `fromService`) | each service               | Render, from `render.yaml` | at apply — nothing to do             |
-| 2   | Env group `autogpt-platform-secrets`             | Blueprint-managed group    | Render (`generateValue`)   | at apply — never touched             |
-| 3   | Env group `autogpt-platform-deploy-secrets`      | group you create           | you, in the Dashboard      | **before apply**, after the Workflow |
-| 4   | Per-service prompts (`sync: false`)              | each service               | you, in the Dashboard      | some at apply, some after URLs exist |
-| 5   | Env group `autogpt-platform-llm`                 | group you create           | you                        | last, after the Workflow exists      |
+| #   | Bucket                                           | Where                   | Who sets it                | When                                 |
+| --- | ------------------------------------------------ | ----------------------- | -------------------------- | ------------------------------------ |
+| 1   | Automatic wires (`fromDatabase` / `fromService`) | each service            | Render, from `render.yaml` | at apply — nothing to do             |
+| 2   | Env group `autogpt-platform-secrets`             | Blueprint-managed group | Render (`generateValue`)   | at apply — never touched             |
+| 3   | Env group `autogpt-platform-deploy-secrets`      | group you create        | you, in the Dashboard      | **before apply**, after the Workflow |
+| 4   | Per-service prompts (`sync: false`)              | each service            | you, in the Dashboard      | some at apply, some after URLs exist |
+| 5   | Env group `autogpt-platform-llm`                 | group you create        | you                        | last, after the Workflow exists      |
 
 Buckets 3, 4, and 5 need your input. The three env groups differ:
 
@@ -125,11 +125,11 @@ apply, rest-server, database-manager, and scheduler-server link to it via `fromG
 value is entered once. Create the [executor Workflow](#manual-step--the-executor-workflow)
 first — you need its slug for the group.
 
-| Key                    | Consumed by (via `fromGroup`)               | What to enter                                                                                                                                                    |
-| ---------------------- | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Key                    | Consumed by (via `fromGroup`)               | What to enter                                                                                                                                                                       |
+| ---------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ENCRYPTION_KEY`       | rest-server + database-manager (+ Workflow) | Fernet key for stored credentials — generate with `python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"` ([details](#generating-encryption_key)) |
-| `RENDER_API_KEY`       | rest-server + scheduler-server (+ Workflow) | Render workspace API key (Workflows dispatch) — Dashboard → Settings → API Keys                                                                                   |
-| `RENDER_WORKFLOW_SLUG` | rest-server + scheduler-server              | Executor Workflow slug — create the Workflow first so it's known before apply                                                                                     |
+| `RENDER_API_KEY`       | rest-server + scheduler-server (+ Workflow) | Render workspace API key (Workflows dispatch) — Dashboard → Settings → API Keys                                                                                                     |
+| `RENDER_WORKFLOW_SLUG` | rest-server + scheduler-server              | Executor Workflow slug — create the Workflow first so it's known before apply                                                                                                       |
 
 The manual Workflow can't join the group (not a blueprint resource) — paste the same
 `ENCRYPTION_KEY` and `RENDER_API_KEY` into it by hand ([Part B](#manual-step--the-executor-workflow)).
@@ -161,14 +161,14 @@ not entered.
 
 Full list of per-service prompts:
 
-| Key                              | Service(s)                                  | What to enter                                                                                                                                                                             |
-| -------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `NEXT_PUBLIC_AGPT_SERVER_URL`    | frontend                                    | `https://<rest-server host>/api` (build-time)                                                                                                                                             |
-| `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend                                    | `wss://<websocket-server host>/ws` (build-time)                                                                                                                                           |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY`  | frontend                                    | Anon JWT signed with `JWT_VERIFY_KEY` (see [below](#generating-the-anon-key))                                                                                                             |
-| `GOTRUE_URI_ALLOW_LIST`          | gotrue                                      | Allowed redirect URLs (e.g. `https://<frontend>/**`)                                                                                                                                      |
-| `GOTRUE_SMTP_*`                  | gotrue                                      | SMTP host/port/user/pass/sender/admin                                                                                                                                                     |
-| `GOTRUE_EXTERNAL_GOOGLE_*`       | gotrue                                      | Optional Google OAuth (leave `ENABLED=false` to skip)                                                                                                                                     |
+| Key                              | Service(s) | What to enter                                                                 |
+| -------------------------------- | ---------- | ----------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_AGPT_SERVER_URL`    | frontend   | `https://<rest-server host>/api` (build-time)                                 |
+| `NEXT_PUBLIC_AGPT_WS_SERVER_URL` | frontend   | `wss://<websocket-server host>/ws` (build-time)                               |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY`  | frontend   | Anon JWT signed with `JWT_VERIFY_KEY` (see [below](#generating-the-anon-key)) |
+| `GOTRUE_URI_ALLOW_LIST`          | gotrue     | Allowed redirect URLs (e.g. `https://<frontend>/**`)                          |
+| `GOTRUE_SMTP_*`                  | gotrue     | SMTP host/port/user/pass/sender/admin                                         |
+| `GOTRUE_EXTERNAL_GOOGLE_*`       | gotrue     | Optional Google OAuth (leave `ENABLED=false` to skip)                         |
 
 `FRONTEND_BASE_URL` is not in this table — it's a placeholder `value:` on rest-server, not a
 prompt (see [URL config layer](#url-config-layer)). Not prompted either: `PLATFORM_BASE_URL`,
@@ -228,7 +228,7 @@ Follow the buckets from [Secrets & environment setup](#secrets--environment-setu
    `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
    [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
 4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
-   `https://` placeholders for the frontend URLs, SMTP if any; leave optional GoTrue keys blank.
+   `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs, SMTP if any; leave optional GoTrue keys blank.
 5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
    and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
 6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
