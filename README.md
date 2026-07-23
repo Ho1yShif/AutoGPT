@@ -75,26 +75,38 @@ steps; the tables there are the source of truth.
 > **The two things to prepare first:** the [executor Workflow](#manual-step--the-executor-workflow)
 > (created by hand — the Blueprint needs its slug) and the
 > [`autogpt-platform-deploy-secrets` env group](#deployer-supplied-keys-bucket-3) (created before
-> you apply). Everything else is entered in the Blueprint prompts or after the first apply.
+> you apply). Because you make the Workflow first, its slug is known up front, so every value you
+> supply — deploy secrets **and** LLM keys — goes into that one group. Everything else is entered
+> in the Blueprint prompts or after the first apply.
 
 1. Fork this repo and push it to your GitHub/GitLab account.
 2. Create the executor Workflow shell ([part A](#manual-step--the-executor-workflow)) and note
    its slug. Its first deploy fails (no DB/Redis/JWT yet) — expected.
 3. Create the `autogpt-platform-deploy-secrets` env group (Dashboard → Env Groups → New) with
-   `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the slug from step 2. See
-   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
+   `ENCRYPTION_KEY`, `RENDER_API_KEY`, the slug from step 2, and your LLM key(s). See
+   [Deployer-supplied keys](#deployer-supplied-keys-bucket-3) and
+   [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
 4. New → Blueprint, select your fork. Fill the phase-1 [per-service prompts](#per-service-prompts-bucket-4):
    `https://example.com` placeholders for the `NEXT_PUBLIC_*` frontend URLs and the anon key.
    (No SMTP needed — signups self-confirm by default.)
 5. Apply. Services link to your group; Render auto-creates the `autogpt-platform-secrets` group
    and `JWT_VERIFY_KEY`, and rest-server runs `prisma migrate deploy` on predeploy.
+
+   > **First-deploy ordering.** Render brings all services up in parallel and does not order
+   > them. `rest-server` is the sole owner of `prisma migrate deploy`, which creates the
+   > `platform` schema. Any service that starts before that predeploy finishes can fail its
+   > first deploy — most commonly **scheduler-server**, whose APScheduler jobstore tries to
+   > create `platform.apscheduler_jobs` and errors with `schema "platform" does not exist`.
+   > This is expected on the initial apply: once rest-server's migrate has completed, simply
+   > **redeploy the failed service** (Manual Deploy → Deploy latest commit) and it goes green.
+
 6. Set the real public URLs (phase 2) once services have their `*.onrender.com` hostnames, then
    redeploy the frontend and rest-server, then gotrue, ws, scheduler, and database-manager. See
    [per-service prompts](#per-service-prompts-bucket-4).
 7. Finish the executor Workflow ([part B](#manual-step--the-executor-workflow)): now that
-   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env and deploy for real.
-8. Create the `autogpt-platform-llm` env group — see
-   [LLM / Claude API keys](#manual-step--llm--claude-api-keys).
+   Postgres, Key Value, and `JWT_VERIFY_KEY` exist, wire its env, link the
+   `autogpt-platform-deploy-secrets` group (it picks up `ENCRYPTION_KEY`, `RENDER_API_KEY`, and
+   the LLM keys in one link), and deploy for real.
 
 Optional, after the app is up: [require email verification](#require-email-verification) (SMTP)
 and [enable Google login](#enable-google-login) — both off by default.
@@ -119,10 +131,11 @@ Part B — finish it (after the apply, step 7):
 
 4. Give it the same wiring as the backend: `DATABASE_URL` + `DIRECT_URL` with
    `?schema=platform`, `REDIS_URL` (or the split `REDIS_*` vars), `REDIS_CLUSTER_MODE=false`,
-   `EXECUTION_BACKEND=workflows`, `RENDER_API_KEY`, `JWT_VERIFY_KEY` (copy from rest-server),
-   the same `ENCRYPTION_KEY` as rest-server (confirm the boot fingerprint matches), plus any
-   provider API keys your graphs use.
-5. Deploy for real. It should boot; graph execution works end-to-end.
+   `EXECUTION_BACKEND=workflows`, and `JWT_VERIFY_KEY` (copy from rest-server).
+5. Link the `autogpt-platform-deploy-secrets` group (Environment → Link Environment Group). That
+   hands the Workflow `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the LLM keys in one link — the same
+   group values rest-server uses, so the boot fingerprints match by construction (no hand-paste).
+6. Deploy for real. It should boot; graph execution works end-to-end.
 
 ### Manual step — LLM / Claude API keys
 
@@ -130,12 +143,12 @@ Two features need an LLM credential: copilot chat (`/api/chat/*`, on rest-server
 blocks (AI Text Generator, `claude_code`, `orchestrator`, on the executor Workflow). The
 deploy succeeds with no key set — these features just return nothing until one is present.
 
-Because `sync: false` is invalid in env groups and the Workflow isn't a Blueprint resource,
-these keys aren't in `render.yaml`. Use one Dashboard env group read by both consumers:
+These keys aren't in `render.yaml` (`sync: false` is invalid in a declared group, and the
+Workflow isn't a Blueprint resource). They go in the same `autogpt-platform-deploy-secrets` group
+as the deploy secrets — one deployer-made group read by both consumers:
 
-1. Create the env group: Dashboard → Env Groups → New → `autogpt-platform-llm`. Don't add it
-   to `render.yaml`.
-2. Add the keys for one transport:
+1. Add the keys to the `autogpt-platform-deploy-secrets` group (the one you create in
+   [step 3](#deploy) with the deploy secrets — don't add it to `render.yaml`). Pick one transport:
 
    | Transport                         | Env to set                                                                                     | Render?                          |
    | --------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------- |
@@ -146,16 +159,19 @@ these keys aren't in `render.yaml`. Use one Dashboard env group read by both con
    Add `OPENAI_API_KEY=<key>` too if OpenAI-based blocks are used (also the OpenRouter
    fallback). AI blocks read `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` directly.
 
-3. Link the group to both consumers — rest-server (copilot chat) and the executor Workflow
-   (AI blocks): Environment → Link Environment Group → `autogpt-platform-llm` → save & redeploy.
-   Sharing the group means each key is entered once.
+2. Both consumers already read the group: rest-server (copilot chat) links it via `fromGroup` in
+   `render.yaml`, and you link it to the executor Workflow (AI blocks) by hand in
+   [Part B](#manual-step--the-executor-workflow). Nothing extra to wire — each key is entered once.
+
+The unused `CHAT_*` / provider keys that also land on `database-manager` and `scheduler-server`
+(they share the group via `fromGroup`) are harmless — see [Notes](#notes--tradeoffs).
 
 ---
 
 ## Secrets & environment setup
 
 This is the reference behind the [Deploy](#deploy) steps above — what each value is, where it
-lives, and when you set it. Every environment value falls into one of five buckets:
+lives, and when you set it. Every environment value falls into one of four buckets:
 
 | #   | Bucket                                           | Where                   | Who sets it                | When                                 |
 | --- | ------------------------------------------------ | ----------------------- | -------------------------- | ------------------------------------ |
@@ -163,21 +179,21 @@ lives, and when you set it. Every environment value falls into one of five bucke
 | 2   | Env group `autogpt-platform-secrets`             | Blueprint-managed group | Render (`generateValue`)   | at apply — never touched             |
 | 3   | Env group `autogpt-platform-deploy-secrets`      | group you create        | you, in the Dashboard      | **before apply**, after the Workflow |
 | 4   | Per-service prompts (`sync: false`)              | each service            | you, in the Dashboard      | some at apply, some after URLs exist |
-| 5   | Env group `autogpt-platform-llm`                 | group you create        | you                        | last, after the Workflow exists      |
 
-Buckets 3, 4, and 5 need your input. The three env groups differ:
+Buckets 3 and 4 need your input. The two env groups differ:
 
 - `autogpt-platform-secrets` — declared in `render.yaml`, auto-created, holds only
   `UNSUBSCRIBE_SECRET_KEY`. You never touch it.
-- `autogpt-platform-deploy-secrets` — you create it before applying with the three deployer
-  secrets; rest-server, database-manager, and scheduler-server link it via `fromGroup`, so each
-  is entered once. See [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
-- `autogpt-platform-llm` — you create it for LLM keys (see
-  [LLM / Claude API keys](#manual-step--llm--claude-api-keys)).
+- `autogpt-platform-deploy-secrets` — you create it before applying with the deploy secrets
+  (`ENCRYPTION_KEY`, `RENDER_API_KEY`, `RENDER_WORKFLOW_SLUG`) **and** the
+  [LLM keys](#manual-step--llm--claude-api-keys); rest-server, database-manager, and
+  scheduler-server link it via `fromGroup`, and you link it to the executor Workflow by hand, so
+  each value is entered once. See [Deployer-supplied keys](#deployer-supplied-keys-bucket-3).
 
 ### What fans out and what doesn't
 
-- Set once: the three deploy secrets (via `fromGroup`), plus `JWT_VERIFY_KEY` (`generateValue`
+- Set once: everything in `autogpt-platform-deploy-secrets` — the three deploy secrets and the
+  LLM keys (via `fromGroup`) — plus `JWT_VERIFY_KEY` (`generateValue`
   on rest-server) and `FRONTEND_BASE_URL` (placeholder `value:` on rest-server), which other
   services pull via `fromService`.
 - Per service: the remaining `sync: false` prompts — frontend URL keys and optional GoTrue keys.
@@ -205,22 +221,25 @@ default.
 
 ### Deployer-supplied keys (bucket 3)
 
-The three deployer secrets go in one env group, `autogpt-platform-deploy-secrets`, that you
-create **before applying** the blueprint (all three values are knowable ahead of time). At
-apply, rest-server, database-manager, and scheduler-server link to it via `fromGroup`, so each
-value is entered once. Create the [executor Workflow](#manual-step--the-executor-workflow)
-first — you need its slug for the group.
+All deployer-supplied values go in one env group, `autogpt-platform-deploy-secrets`, that you
+create **before applying** the blueprint — every value is knowable ahead of time once the
+[executor Workflow](#manual-step--the-executor-workflow) exists (create it first — you need its
+slug). At apply, rest-server, database-manager, and scheduler-server link to it via `fromGroup`,
+so each value is entered once.
 
-| Key                    | Consumed by (via `fromGroup`)               | What to enter                                                                                                                                                                       |
+| Key                    | Consumed by                                 | What to enter                                                                                                                                                                       |
 | ---------------------- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ENCRYPTION_KEY`       | rest-server + database-manager (+ Workflow) | Fernet key for stored credentials — generate with `python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"` ([details](#generating-encryption_key)) |
 | `RENDER_API_KEY`       | rest-server + scheduler-server (+ Workflow) | Render workspace API key (Workflows dispatch) — Dashboard → Settings → API Keys                                                                                                     |
 | `RENDER_WORKFLOW_SLUG` | rest-server + scheduler-server              | Executor Workflow slug — create the Workflow first so it's known before apply                                                                                                       |
+| LLM keys               | rest-server + Workflow                      | Copilot chat + AI blocks — pick a transport in [LLM / Claude API keys](#manual-step--llm--claude-api-keys)                                                                          |
 
-The manual Workflow can't join the group (not a blueprint resource) — paste the same
-`ENCRYPTION_KEY` and `RENDER_API_KEY` into it by hand ([Part B](#manual-step--the-executor-workflow)).
-`fromGroup` is all-or-nothing, so database-manager and scheduler-server each get all three keys
-and use the subset they need — one group to manage instead of two.
+The manual Workflow can't use `fromGroup` (it isn't a blueprint resource), but it **can** link
+the group by hand in the Dashboard ([Part B](#manual-step--the-executor-workflow)) — that's how
+it picks up `ENCRYPTION_KEY`, `RENDER_API_KEY`, and the LLM keys without re-entering them, and it
+guarantees its `ENCRYPTION_KEY` fingerprint matches rest-server's. `fromGroup` is all-or-nothing,
+so database-manager and scheduler-server each receive every key in the group and use the subset
+they need (the LLM/slug keys they ignore are harmless) — one group to manage instead of two.
 
 ### Per-service prompts (bucket 4)
 
@@ -230,8 +249,8 @@ Phase 1 — at apply, values you already control:
 
 - Frontend URL keys — enter a valid `https://` placeholder (e.g. `https://example.com`); an
   empty or malformed value fails validation at boot
-(SMTP is not entered here — signups self-confirm by default. See
-[Require email verification](#require-email-verification) to turn it on.)
+  (SMTP is not entered here — signups self-confirm by default. See
+  [Require email verification](#require-email-verification) to turn it on.)
 
 Phase 2 — after the first apply, values that need the `*.onrender.com` hostnames:
 
@@ -243,7 +262,7 @@ Phase 2 — after the first apply, values that need the `*.onrender.com` hostnam
 Then redeploy the frontend and rest-server, then gotrue, ws, scheduler, and database-manager
 (they pull the new `FRONTEND_BASE_URL` on their next deploy). Derived vars
 (`PLATFORM_BASE_URL`, `BACKEND_CORS_ALLOW_ORIGINS`, `NEXT_PUBLIC_SUPABASE_URL`,
-`NEXT_PUBLIC_FRONTEND_BASE_URL`, GoTrue's `GOTRUE_SITE_URL` / `GOTRUE_API_EXTERNAL_URL`) are
+`NEXT_PUBLIC_FRONTEND_BASE_URL`, GoTrue's `GOTRUE_SITE_URL` / `API_EXTERNAL_URL`) are
 not entered.
 
 Full list of per-service prompts:
@@ -263,7 +282,7 @@ turn them on after deploy if you want them:
 `FRONTEND_BASE_URL` is not in this table — it's a placeholder `value:` on rest-server, not a
 prompt (see [URL config layer](#url-config-layer)). Not prompted either: `PLATFORM_BASE_URL`,
 `BACKEND_CORS_ALLOW_ORIGINS`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_FRONTEND_BASE_URL`,
-GoTrue's `GOTRUE_SITE_URL` / `GOTRUE_API_EXTERNAL_URL`, and every consumer's
+GoTrue's `GOTRUE_SITE_URL` / `API_EXTERNAL_URL`, and every consumer's
 `FRONTEND_BASE_URL` / `JWT_VERIFY_KEY` (all derived or pulled via `fromService`).
 
 The authoritative source is [`render.yaml`](render.yaml) — each `sync: false` entry carries a
@@ -280,14 +299,14 @@ relay (Render has no managed email) and flip the flag:
 1. Open the **gotrue** service → **Environment** tab.
 2. Add the six SMTP keys (values from your provider, e.g. Resend, Postmark, SendGrid, Mailgun):
 
-   | Key                      | Example value                    |
-   | ------------------------ | -------------------------------- |
-   | `GOTRUE_SMTP_HOST`       | `smtp.resend.com`                |
-   | `GOTRUE_SMTP_PORT`       | `465` (SSL) or `587` (STARTTLS)  |
-   | `GOTRUE_SMTP_USER`       | provider username / API-key name |
-   | `GOTRUE_SMTP_PASS`       | provider password / API key      |
-   | `GOTRUE_SMTP_SENDER_NAME`| `AutoGPT Platform`               |
-   | `GOTRUE_SMTP_ADMIN_EMAIL`| a verified sender, e.g. `noreply@yourdomain.com` |
+   | Key                       | Example value                                    |
+   | ------------------------- | ------------------------------------------------ |
+   | `GOTRUE_SMTP_HOST`        | `smtp.resend.com`                                |
+   | `GOTRUE_SMTP_PORT`        | `465` (SSL) or `587` (STARTTLS)                  |
+   | `GOTRUE_SMTP_USER`        | provider username / API-key name                 |
+   | `GOTRUE_SMTP_PASS`        | provider password / API key                      |
+   | `GOTRUE_SMTP_SENDER_NAME` | `AutoGPT Platform`                               |
+   | `GOTRUE_SMTP_ADMIN_EMAIL` | a verified sender, e.g. `noreply@yourdomain.com` |
 
 3. Set `GOTRUE_MAILER_AUTOCONFIRM=false`.
 4. **Save changes** — Render redeploys gotrue automatically.
@@ -306,12 +325,12 @@ after deploy:
    `https://<gotrue host>.onrender.com/auth/v1/callback`.
 2. On the **gotrue** service → **Environment** tab, add:
 
-   | Key                                  | Value                                                          |
-   | ------------------------------------ | -------------------------------------------------------------- |
-   | `GOTRUE_EXTERNAL_GOOGLE_ENABLED`     | `true`                                                         |
-   | `GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID`   | Client ID from Google                                          |
-   | `GOTRUE_EXTERNAL_GOOGLE_SECRET`      | Client secret from Google                                      |
-   | `GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI`| `https://<gotrue host>.onrender.com/auth/v1/callback`          |
+   | Key                                   | Value                                                 |
+   | ------------------------------------- | ----------------------------------------------------- |
+   | `GOTRUE_EXTERNAL_GOOGLE_ENABLED`      | `true`                                                |
+   | `GOTRUE_EXTERNAL_GOOGLE_CLIENT_ID`    | Client ID from Google                                 |
+   | `GOTRUE_EXTERNAL_GOOGLE_SECRET`       | Client secret from Google                             |
+   | `GOTRUE_EXTERNAL_GOOGLE_REDIRECT_URI` | `https://<gotrue host>.onrender.com/auth/v1/callback` |
 
 3. Ensure the callback URL is also in `GOTRUE_URI_ALLOW_LIST`.
 4. **Save changes** — gotrue redeploys with Google login enabled.
@@ -344,8 +363,10 @@ Generate one with stdlib:
 python3 -c "import os,base64; print(base64.urlsafe_b64encode(os.urandom(32)).decode())"
 ```
 
-Put it in the `autogpt-platform-deploy-secrets` group and paste the same value into the manual
-Workflow. It can't be `generateValue` (may emit chars Fernet rejects).
+Put it in the `autogpt-platform-deploy-secrets` group. Blueprint services pull it via `fromGroup`
+and the Workflow reads the same group by linking it ([Part B](#manual-step--the-executor-workflow)),
+so every consumer gets the identical value — no hand-copying. It can't be `generateValue` (may
+emit chars Fernet rejects).
 
 Each service with the key logs `ENCRYPTION_KEY loaded (fingerprint=<12 hex chars>)` at boot —
 confirm rest-server, database-manager, and the Workflow print the same fingerprint; a mismatch

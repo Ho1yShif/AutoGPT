@@ -101,7 +101,12 @@ projects:
               - key: GOTRUE_API_PORT
                 value: "10000"           # == Render default PORT (rewrite target)
               # FRONTEND_BASE_URL pulled from rest-server (the owner) — no re-prompt.
-              - key: GOTRUE_API_EXTERNAL_URL
+              # NOTE: this key is UNPREFIXED (API_EXTERNAL_URL, not
+              # GOTRUE_API_EXTERNAL_URL). GoTrue reads it via an explicit
+              # envconfig:"API_EXTERNAL_URL" tag that overrides the GOTRUE_
+              # prefix; the prefixed form is silently ignored and boot fails
+              # with `required key API_EXTERNAL_URL missing value`.
+              - key: API_EXTERNAL_URL
                 fromService:
                   name: rest-server
                   type: web
@@ -453,8 +458,11 @@ projects:
 # Two groups are referenced via `fromGroup` above:
 #   autogpt-platform-secrets        — declared below; Blueprint-managed.
 #   autogpt-platform-deploy-secrets — deployer-made, NOT declared here. Holds
-#     ENCRYPTION_KEY / RENDER_API_KEY / RENDER_WORKFLOW_SLUG; created by hand
-#     before apply so services boot with values present (README). Undeclared
+#     ENCRYPTION_KEY / RENDER_API_KEY / RENDER_WORKFLOW_SLUG plus the LLM keys
+#     (OPEN_ROUTER_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY / CHAT_*);
+#     created by hand before apply so services boot with values present
+#     (README). The manual executor Workflow links this same group in the
+#     Dashboard for ENCRYPTION_KEY / RENDER_API_KEY / LLM keys. Undeclared
 #     because sync:false is ignored in declared groups; `render blueprints
 #     validate` and apply both expect it to already exist in the workspace.
 # JWT_VERIFY_KEY stays a rest-server generateValue (fanned out), not in a group.
