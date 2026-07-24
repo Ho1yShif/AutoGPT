@@ -118,6 +118,16 @@ projects:
                 fromDatabase:
                   name: autogpt-platform-db
                   property: connectionString
+              # NOTE: GoTrue's add_mfa_schema migration creates enum types with
+              # UNqualified DDL (`create type factor_type ...`), so they land in
+              # search_path[0]; a later migration references `auth.factor_type`
+              # explicitly and fails unless those enums landed in `auth`. GoTrue
+              # connects with this raw connectionString and its pop/pgx driver
+              # sets NO search_path of its own (internal/storage/dial.go), so it
+              # inherits the connecting role's default. rest-server's migrate step
+              # pins that default with `auth` first (ALTER ROLE ... SET
+              # search_path — see render/entrypoint.sh); an env var like PGOPTIONS
+              # does NOT work here (pop rebuilds its DSN and drops it).
               # JWT secret == backend JWT_VERIFY_KEY (rest-server's service-level
               # generateValue). A mismatch here breaks all auth.
               - key: GOTRUE_JWT_SECRET

@@ -55,6 +55,19 @@ deploy_line=$(grep -n "prisma migrate deploy" "$CALLS" | head -1 | cut -d: -f1)
 grep -q -- "--url $RENDER_DIRECT_URL " "$CALLS" \
   || grep -q -- "--url $RENDER_DIRECT_URL$" "$CALLS" \
   || fail "auth schema not created against the raw DIRECT_URL"
+
+# The migrate role must pin the connecting role's default search_path with `auth`
+# first. GoTrue connects with the same DB role and its pop/pgx driver sets no
+# search_path of its own, so it inherits this default; `auth` first makes its
+# unqualified `create type` DDL land in `auth` (see entrypoint.sh migrate role).
+grep -q "ALTER ROLE CURRENT_USER SET search_path = auth" "$CALLS" \
+  || fail "migrate role did not set the role default search_path with auth first"
+
+# The role search_path must also be set on the RAW url (same statement stream as
+# CREATE SCHEMA), not the ?schema=platform-wrapped one.
+searchpath_line=$(grep -n "ALTER ROLE CURRENT_USER SET search_path = auth" "$CALLS" | head -1 | cut -d: -f1)
+[ "$searchpath_line" -gt "$schema_line" ] \
+  || fail "search_path should be set alongside/after CREATE SCHEMA on the raw url"
 teardown
 
-echo "PASS: entrypoint migrate role creates auth schema before migrate deploy"
+echo "PASS: entrypoint migrate role creates auth schema + pins auth-first search_path on the raw url before migrate deploy"
