@@ -35,13 +35,27 @@ case "$role" in
     exec env DATABASE_API_PORT="$PORT" "$BIN/db"
     ;;
   migrate)
-    # GoTrue owns the `auth` schema but its image can't create it — its first
+    # GoTrue's stock image can't bootstrap its `auth` schema on Render: its first
     # migration runs `CREATE TABLE auth.users` and aborts with `schema "auth"
     # does not exist` if the schema is absent (in the stock Supabase stack the
-    # Postgres init scripts create it; on Render nothing does). rest-server is
-    # the sole DB-DDL owner (inv #3), so create it here on the RAW url (no
-    # ?schema=platform wrapper) before Prisma runs.
-    echo 'CREATE SCHEMA IF NOT EXISTS auth;' | "$BIN/prisma" db execute --url "$RENDER_DIRECT_URL" --stdin
+    # Postgres init scripts create it; on Render nothing does). rest-server is the
+    # sole DB-DDL owner (inv #3), so create it here on the RAW url (no
+    # ?schema=platform wrapper) before Prisma runs, so it lands in the database
+    # default rather than scoped under `platform`.
+    #
+    # GoTrue's OTHER migration gap: add_mfa_schema creates enum types with
+    # UNqualified DDL (`create type factor_type ...`) that land in search_path[0],
+    # while a later migration references `auth.factor_type` explicitly and fails
+    # unless those enums landed in `auth`. GoTrue's pop/pgx driver sets no
+    # search_path of its own (internal/storage/dial.go), so it inherits the
+    # connecting role's default. Pin `auth` first on that role's default here
+    # (GoTrue and this migrate step share the same DB role). Backend services are
+    # unaffected: they connect with ?schema=platform, which sets a per-session
+    # search_path that overrides this default.
+    "$BIN/prisma" db execute --url "$RENDER_DIRECT_URL" --stdin <<'SQL'
+CREATE SCHEMA IF NOT EXISTS auth;
+ALTER ROLE CURRENT_USER SET search_path = auth, public, extensions;
+SQL
     exec "$BIN/prisma" migrate deploy
     ;;
   *)
